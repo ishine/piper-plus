@@ -11,6 +11,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
 
+from .vits.commons import remap_weight_norm_keys
 from .vits.ema import EMACallback
 from .vits.lightning import VitsModel
 
@@ -589,9 +590,10 @@ def main():
             map_location="cpu",
             weights_only=False,
         )
-        missing, unexpected = model.load_state_dict(
-            checkpoint["state_dict"], strict=False
+        remapped_sd = remap_weight_norm_keys(
+            checkpoint["state_dict"], model.state_dict()
         )
+        missing, unexpected = model.load_state_dict(remapped_sd, strict=False)
         _LOGGER.info(
             "Weights loaded (strict=False). Missing keys: %s. Unexpected keys: %s.",
             missing,
@@ -601,8 +603,8 @@ def main():
         # 2. emb_g 平均を emb_lang に加算（conditioning 分布補正）
         #    emb_g は平均ノルム ~0.68 でほぼゼロ中心のため影響は軽微だが、
         #    conceptual correctness のため実施する。
-        saved_sd = checkpoint["state_dict"]
-        emb_g_weight = saved_sd.get("model_g.emb_g.weight")
+        raw_sd = checkpoint["state_dict"]
+        emb_g_weight = raw_sd.get("model_g.emb_g.weight")
         if emb_g_weight is not None and hasattr(model.model_g, "emb_lang"):
             emb_g_mean = emb_g_weight.mean(dim=0)  # [gin_channels]
             _LOGGER.info(
@@ -652,7 +654,10 @@ def main():
             checkpoint = torch.load(
                 args.resume_from_checkpoint, map_location="cpu", weights_only=False
             )
-            model.load_state_dict(checkpoint["state_dict"], strict=False)
+            remapped_sd = remap_weight_norm_keys(
+                checkpoint["state_dict"], model.state_dict()
+            )
+            model.load_state_dict(remapped_sd, strict=False)
 
             _LOGGER.info(
                 "Weights loaded successfully with strict=False. Starting training without resuming optimizer state."  # noqa: E501
@@ -675,6 +680,7 @@ def main():
 
 def load_state_dict(model, saved_state_dict):
     state_dict = model.state_dict()
+    saved_state_dict = remap_weight_norm_keys(saved_state_dict, state_dict)
     new_state_dict = {}
 
     for k, v in state_dict.items():

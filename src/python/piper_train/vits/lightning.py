@@ -545,9 +545,7 @@ class VitsModel(pl.LightningModule):
             batch.language_ids if batch.language_ids is not None else None,
             batch.prosody_features if batch.prosody_features is not None else None,
         )
-        speaker_embeddings = (
-            batch.speaker_embeddings if batch.speaker_embeddings is not None else None
-        )
+        speaker_embeddings = getattr(batch, "speaker_embeddings", None)
 
         # Speaker embedding perturbation for zero-shot generalization
         # (sigma=0.05 improves robustness to unseen speaker embeddings at inference)

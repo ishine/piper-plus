@@ -87,15 +87,19 @@ def loaded_model():
         spk_embed_dim=hp.get("spk_embed_dim", 192),
     )
 
+    from piper_train.vits.commons import remap_weight_norm_keys
+
     model_state = {}
     for k, v in state_dict.items():
         if k.startswith("model_g."):
             model_state[k[len("model_g."):]] = v
 
+    # Remap weight_norm keys (DDP parametrized ↔ legacy format)
+    model_state = remap_weight_norm_keys(model_state, model.state_dict())
+
     # Filter out keys whose shapes changed or were renamed between model versions:
     # 1. flow.post keys (mean_only=True vs False shape change)
     # 2. enc_p.cond -> enc_p.cond_layer rename
-    # 3. dec.ups weight_norm -> parametrizations.weight change
     model_params = dict(model.named_parameters())
     model_bufs = dict(model.named_buffers())
     incompatible_keys = []

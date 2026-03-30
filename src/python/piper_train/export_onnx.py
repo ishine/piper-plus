@@ -10,6 +10,7 @@ import torch
 
 from .tools.convert_fp16 import convert_fp16
 from .vits import commons
+from .vits.commons import remap_weight_norm_keys
 from .vits.lightning import VitsModel
 
 
@@ -260,23 +261,25 @@ def main() -> None:
     model = VitsModel.load_from_checkpoint(args.checkpoint, dataset=None, strict=False)
     model_g = model.model_g
 
-    # Load raw checkpoint for _orig_mod stripping and EMA application.
-    # Must happen early: _orig_mod fix restores weights that load_from_checkpoint
-    # silently missed, and EMA must be applied BEFORE remove_weight_norm().
+    # Load raw checkpoint for _orig_mod stripping, weight_norm remapping, and EMA.
+    # Must happen early: fixes restore weights that load_from_checkpoint silently
+    # missed, and EMA must be applied BEFORE remove_weight_norm().
     ckpt = torch.load(args.checkpoint, map_location="cpu")
 
-    # Fix torch.compile artifact: strip _orig_mod prefix from state_dict keys.
-    # When torch.compile is active during checkpoint save, keys get prefixed with
-    # _orig_mod (e.g. model_g.dec._orig_mod.conv_pre.weight).  strict=False above
-    # silently ignores these, leaving weights uninitialised.
     raw_sd = ckpt.get("state_dict", {})
+
+    # Fix torch.compile artifact: strip _orig_mod prefix from state_dict keys.
     cleaned_sd, n_stripped = _strip_orig_mod(raw_sd)
-    if n_stripped > 0:
+
+    # Fix DDP weight_norm format mismatch (parametrized ↔ legacy).
+    cleaned_sd = remap_weight_norm_keys(cleaned_sd, model.state_dict())
+
+    if n_stripped > 0 or cleaned_sd is not raw_sd:
         missing, unexpected = model.load_state_dict(cleaned_sd, strict=False)
         if missing:
-            _LOGGER.debug("Keys still missing after _orig_mod strip: %d", len(missing))
+            _LOGGER.debug("Keys still missing after fixups: %d", len(missing))
         if unexpected:
-            _LOGGER.debug("Unexpected keys after _orig_mod strip: %d", len(unexpected))
+            _LOGGER.debug("Unexpected keys after fixups: %d", len(unexpected))
 
     num_symbols = model_g.n_vocab
     num_speakers = model_g.n_speakers
@@ -320,7 +323,9 @@ def main() -> None:
         applied = 0
         skipped = 0
         dec_params = dict(model_g.dec.named_parameters())
-        for name, shadow_param in ema_state["shadow_params"].items():
+        # Remap shadow param keys for weight_norm format compatibility
+        shadow = remap_weight_norm_keys(ema_state["shadow_params"], dec_params)
+        for name, shadow_param in shadow.items():
             if name in dec_params:
                 dec_params[name].data.copy_(shadow_param)
                 applied += 1
@@ -343,7 +348,10 @@ def main() -> None:
         applied = 0
         skipped = 0
         spk_proj_params = dict(model_g.spk_proj.named_parameters())
-        for name, shadow_param in ema_spk_proj_state["shadow_params"].items():
+        shadow = remap_weight_norm_keys(
+            ema_spk_proj_state["shadow_params"], spk_proj_params
+        )
+        for name, shadow_param in shadow.items():
             if name in spk_proj_params:
                 spk_proj_params[name].data.copy_(shadow_param)
                 applied += 1
