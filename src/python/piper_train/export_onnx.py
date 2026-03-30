@@ -274,7 +274,7 @@ def main() -> None:
     # Fix DDP weight_norm format mismatch (parametrized ↔ legacy).
     cleaned_sd = remap_weight_norm_keys(cleaned_sd, model.state_dict())
 
-    if n_stripped > 0 or cleaned_sd is not raw_sd:
+    if n_stripped > 0 or cleaned_sd != raw_sd:
         missing, unexpected = model.load_state_dict(cleaned_sd, strict=False)
         if missing:
             _LOGGER.debug("Keys still missing after fixups: %d", len(missing))
