@@ -283,7 +283,10 @@ def create_parser():
         help="Limit training to N batches per epoch (for testing). Default: None (no limit).",
     )
     parser.add_argument(
-        "--max_epochs", type=int, default=1000, help="Maximum number of epochs"
+        "--max_epochs",
+        type=int,
+        default=100,
+        help="Maximum number of epochs (default: 100)",
     )
     parser.add_argument(
         "--default_root_dir", default=None, help="Default path for logs and weights"
@@ -294,6 +297,60 @@ def create_parser():
         help="Path to checkpoint to resume from",
     )
     VitsModel.add_model_specific_args(parser)
+    # Zero-shot speaker conditioning arguments
+    parser.add_argument(
+        "--spk-emb-noise-sigma",
+        type=float,
+        default=0.05,
+        help="Gaussian noise sigma for speaker embedding perturbation during training "
+        "(default: 0.05). Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--d-update-interval",
+        type=int,
+        default=1,
+        help="Discriminator update interval relative to generator (D:G ratio). "
+        "Default: 2 (update D every 2 G steps).",
+    )
+    # LR scheduler arguments
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=("cosine", "exponential"),
+        default="cosine",
+        help="Learning rate scheduler type (default: cosine). "
+        "'cosine' uses CosineAnnealingLR with warmup; "
+        "'exponential' uses the legacy ExponentialLR (gamma=lr_decay).",
+    )
+    parser.add_argument(
+        "--lr-warmup-epochs",
+        type=int,
+        default=5,
+        help="Number of linear warmup epochs for cosine scheduler (default: 5). "
+        "Ignored when --lr-scheduler=exponential.",
+    )
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=1e-5,
+        help="Minimum learning rate for cosine annealing (default: 1e-5). "
+        "Ignored when --lr-scheduler=exponential.",
+    )
+    # Speaker embedding dropout (deprecated)
+    parser.add_argument(
+        "--spk-emb-dropout",
+        type=float,
+        default=0.0,
+        help="(deprecated, ignored) Speaker embedding dropout rate. "
+        "This argument is kept for backward compatibility but has no effect.",
+    )
+    # Speaker encoder path
+    parser.add_argument(
+        "--speaker-encoder-path",
+        type=str,
+        default=None,
+        help="Path to speaker encoder ONNX for embedding extraction "
+        "(SCL now uses mel-domain loss).",
+    )
     parser.add_argument(
         "--compile",
         action="store_true",
@@ -399,6 +456,23 @@ def main():
 
     if args.no_wavlm:
         dict_args["use_wavlm_discriminator"] = False
+
+    # Warn about deprecated --spk-emb-dropout
+    if getattr(args, "spk_emb_dropout", 0.0) != 0.0:
+        _LOGGER.warning(
+            "--spk-emb-dropout is deprecated and ignored. Value %.2f will have no effect.",
+            args.spk_emb_dropout,
+        )
+
+    # Log new training parameters
+    _LOGGER.info("Speaker embedding noise sigma: %s", args.spk_emb_noise_sigma)
+    _LOGGER.info("D:G update interval: %s", args.d_update_interval)
+    _LOGGER.info(
+        "LR scheduler: %s (warmup=%d epochs, min_lr=%.1e)",
+        args.lr_scheduler,
+        args.lr_warmup_epochs,
+        args.lr_min,
+    )
 
     # Set learning rate (either scaled or base)
     if hasattr(args, "auto_lr_scaling") and args.auto_lr_scaling and num_gpus > 1:

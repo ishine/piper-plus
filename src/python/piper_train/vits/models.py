@@ -354,12 +354,33 @@ class Generator(torch.nn.Module):
         self.ups.apply(init_weights)
 
         if gin_channels != 0:
-            self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
+            # Input-stage FiLM: scale + shift for upsample_initial_channel
+            self.cond = nn.Conv1d(gin_channels, upsample_initial_channel * 2, 1)
+
+            # Multi-scale FiLM: one FiLM layer per upsample stage
+            self.cond_layers = nn.ModuleList()
+            for i in range(self.num_upsamples):
+                ch_stage = upsample_initial_channel // (2 ** (i + 1))
+                layer = nn.Conv1d(gin_channels, ch_stage * 2, 1)
+                # Zero-init so FiLM is identity (scale=0.5+0.5=1, shift=0) at start
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+                self.cond_layers.append(layer)
+
+    def _apply_film(self, x, scale_shift):
+        """Apply FiLM conditioning with sigmoid activation.
+
+        scale = sigmoid(scale_raw) + 0.5  -> range [0.5, 1.5]
+        x = x * scale + shift
+        """
+        scale_raw, shift = scale_shift.split(scale_shift.size(1) // 2, dim=1)
+        scale = torch.sigmoid(scale_raw) + 0.5
+        return x * scale + shift
 
     def forward(self, x, g=None):
         x = self.conv_pre(x)
         if g is not None:
-            x = x + self.cond(g)
+            x = self._apply_film(x, self.cond(g))
 
         for i, up in enumerate(self.ups):
             x = F.leaky_relu(x, self.LRELU_SLOPE)
@@ -372,6 +393,9 @@ class Generator(torch.nn.Module):
                 elif (index > 0) and (index < self.num_kernels):
                     xs = xs + resblock(x)  # Non-in-place addition
             x = xs / self.num_kernels
+            # Multi-scale FiLM after each upsample + resblock stage
+            if g is not None:
+                x = self._apply_film(x, self.cond_layers[i](g))
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         x = torch.tanh(x)
@@ -759,6 +783,9 @@ class SynthesizerTrn(nn.Module):
         use_sdp: bool = True,
         prosody_dim: int = 16,
         prosody_language_ids: "set[int] | None" = None,
+        # Accepted for backward compat but unused (spk_proj is always used for n_speakers > 1)
+        use_zero_shot: bool = True,
+        spk_embed_dim: int = 192,
     ):
         super().__init__()
         self.n_vocab = n_vocab
@@ -840,30 +867,67 @@ class SynthesizerTrn(nn.Module):
                 dp_in_channels, 256, 3, 0.5, gin_channels=gin_channels
             )
 
+        # Speaker projection MLP for zero-shot speaker conditioning.
+        # Replaces emb_g (nn.Embedding) -- all speaker conditioning now goes
+        # through spk_proj, eliminating the dual-mode mismatch between
+        # emb_g (used for speaker-ID training) and spk_proj (used at inference).
         if n_speakers > 1:
-            self.emb_g = nn.Embedding(n_speakers, gin_channels)
+            self.spk_proj = nn.Sequential(
+                nn.Linear(192, gin_channels),
+                nn.LayerNorm(gin_channels),
+                nn.GELU(),
+                nn.Linear(gin_channels, gin_channels),
+            )
 
         if n_languages > 1:
             self.emb_lang = nn.Embedding(n_languages, gin_channels)
 
-    def _get_global_conditioning(self, sid=None, lid=None):
+    def _get_speaker_condition(self, speaker_embeddings=None):
+        """Project speaker embeddings through spk_proj MLP.
+
+        Parameters
+        ----------
+        speaker_embeddings : torch.Tensor or None
+            Raw speaker embeddings from CAM++ [batch, 192]
+
+        Returns
+        -------
+        torch.Tensor or None
+            Projected speaker conditioning [batch, gin_channels, 1]
+        """
+        if speaker_embeddings is None:
+            return None
+        if not hasattr(self, "spk_proj"):
+            return None
+        # spk_proj: Linear(192, gin_channels) -> LayerNorm -> GELU -> Linear(gin_channels, gin_channels)
+        g = self.spk_proj(speaker_embeddings)  # [b, gin_channels]
+        return g.unsqueeze(-1)  # [b, gin_channels, 1]
+
+    def _get_global_conditioning(self, sid=None, lid=None, speaker_embeddings=None):
         """Compute global conditioning vector from speaker and language embeddings.
+
+        For multi-speaker models, speaker conditioning is always provided via
+        speaker_embeddings (192-dim CAM++ vectors) projected through spk_proj.
+        The sid argument is accepted for ONNX signature compatibility but is
+        not used internally.
 
         Parameters
         ----------
         sid : torch.LongTensor or None
-            Speaker IDs [batch]
+            Speaker IDs [batch]. Accepted for API/ONNX compatibility but
+            not used -- all speaker conditioning goes through spk_proj.
         lid : torch.LongTensor or None
             Language IDs [batch]
+        speaker_embeddings : torch.Tensor or None
+            Raw speaker embeddings from CAM++ [batch, 192].
+            Required for multi-speaker models.
 
         Returns
         -------
         torch.Tensor or None
             Global conditioning [batch, gin_channels, 1]
         """
-        g = None
-        if self.n_speakers > 1 and sid is not None:
-            g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
+        g = self._get_speaker_condition(speaker_embeddings)
         if self.n_languages > 1 and lid is not None:
             lang_emb = self.emb_lang(lid).unsqueeze(-1)  # [b, h, 1]
             g = (g + lang_emb) if g is not None else lang_emb
@@ -926,9 +990,19 @@ class SynthesizerTrn(nn.Module):
         return x_dp
 
     def forward(
-        self, x, x_lengths, y, y_lengths, sid=None, lid=None, prosody_features=None
+        self,
+        x,
+        x_lengths,
+        y,
+        y_lengths,
+        sid=None,
+        lid=None,
+        prosody_features=None,
+        speaker_embeddings=None,
     ):
-        g = self._get_global_conditioning(sid, lid)
+        g = self._get_global_conditioning(
+            sid, lid, speaker_embeddings=speaker_embeddings
+        )
         x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
 
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
@@ -1001,10 +1075,16 @@ class SynthesizerTrn(nn.Module):
         noise_scale_w=0.8,
         max_len=None,
         prosody_features=None,
+        speaker_embeddings=None,
     ):
         if self.n_speakers > 1:
-            assert sid is not None, "Missing speaker id"
-        g = self._get_global_conditioning(sid, lid)
+            assert speaker_embeddings is not None, (
+                "Missing speaker_embeddings. "
+                "Provide 192-dim CAM++ embeddings for multi-speaker inference."
+            )
+        g = self._get_global_conditioning(
+            sid, lid, speaker_embeddings=speaker_embeddings
+        )
         x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, g=g)
 
         # Prepare input for duration predictor with prosody features
@@ -1040,10 +1120,23 @@ class SynthesizerTrn(nn.Module):
 
         return o, attn, y_mask, (z, z_p, m_p, logs_p)
 
-    def voice_conversion(self, y, y_lengths, sid_src, sid_tgt, lid=None):
+    def voice_conversion(
+        self,
+        y,
+        y_lengths,
+        sid_src=None,
+        sid_tgt=None,
+        lid=None,
+        speaker_embeddings_src=None,
+        speaker_embeddings_tgt=None,
+    ):
         assert self.n_speakers > 1, "n_speakers have to be larger than 1."
-        g_src = self._get_global_conditioning(sid_src, lid)
-        g_tgt = self._get_global_conditioning(sid_tgt, lid)
+        g_src = self._get_global_conditioning(
+            sid_src, lid, speaker_embeddings=speaker_embeddings_src
+        )
+        g_tgt = self._get_global_conditioning(
+            sid_tgt, lid, speaker_embeddings=speaker_embeddings_tgt
+        )
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
         z_p = self.flow(z, y_mask, g=g_src)
         z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)

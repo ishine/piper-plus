@@ -9,7 +9,13 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from .commons import slice_segments
 from .dataset import Batch, PiperDataset, SpeakerBalancedBatchSampler, UtteranceCollate
-from .losses import discriminator_loss, feature_loss, generator_loss, kl_loss
+from .losses import (
+    discriminator_loss,
+    feature_loss,
+    generator_loss,
+    kl_loss,
+    mel_speaker_consistency_loss,
+)
 from .mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from .models import MultiPeriodDiscriminator, SynthesizerTrn, WavLMDiscriminator
 
@@ -78,7 +84,7 @@ class VitsModel(pl.LightningModule):
         batch_size: int = 1,
         lr_decay: float = 0.999875,
         init_lr_ratio: float = 1.0,
-        warmup_epochs: int = 0,
+        warmup_epochs: int = 5,
         c_mel: int = 45,
         c_kl: float = 1.0,
         grad_clip: float | None = None,
@@ -87,12 +93,26 @@ class VitsModel(pl.LightningModule):
         num_test_examples: int = 2,
         validation_split: float = 0.1,
         max_phoneme_ids: int | None = None,
-        validate_cache: bool = False,
+        # Zero-shot TTS (enabled by default for multi-speaker models)
+        use_zero_shot: bool = True,
+        spk_embed_dim: int = 192,
+        c_spk: float = 1.0,
+        c_dino: float = 0.5,
+        speaker_encoder_path: str | None = None,
+        freeze_speaker_encoder_steps: int = 100000,
+        # Speaker embedding dropout for dual-mode training (DEPRECATED: no longer used,
+        # spk_proj is now the sole speaker conditioning path)
+        spk_emb_dropout: float = 0.0,
+        # KL annealing: linearly increase KL weight from 0.1 to c_kl over this many epochs
+        kl_annealing_epochs: int = 10,
         # WavLM Discriminator (enabled by default for improved audio quality)
         use_wavlm_discriminator: bool = True,
         wavlm_model_name: str = "microsoft/wavlm-base-plus",
         c_wavlm: float = 0.5,
-        wavlm_every_n_steps: int = 1,
+        # Training loop optimization
+        # D:G update ratio (D updates every step, G updates every d_update_interval steps)
+        d_update_interval: int = 2,
+        max_spec_length: int = 700,
         **kwargs,
     ):
         super().__init__()
@@ -414,16 +434,35 @@ class VitsModel(pl.LightningModule):
         # Manual optimization for multiple optimizers
         opt_g, opt_d = self.optimizers()
 
-        # Train generator
-        opt_g.zero_grad()
-        loss_g = self.training_step_g(batch)
-        self.manual_backward(loss_g)
-        opt_g.step()
+        # D:G update ratio: G forward is always needed (produces _y, _y_hat for D),
+        # but G backward+step only runs every d_update_interval steps.
+        d_update_interval = self.hparams.d_update_interval
+        grad_clip = getattr(self.hparams, "grad_clip", None)
+        update_generator = self.global_step % d_update_interval == 0
 
-        # Train discriminator
+        # Always run G forward pass (needed for _y, _y_hat used by D)
+        loss_g = self.training_step_g(batch)
+
+        if update_generator:
+            # Train generator: backward + optimizer step
+            opt_g.zero_grad()
+            self.manual_backward(loss_g)
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.model_g.parameters(), grad_clip)
+            opt_g.step()
+        else:
+            # Skip G update on this step (D-only step)
+            self._log_with_batch_info("g_step_skipped", 1.0, batch)
+
+        # Train discriminator (every step)
         opt_d.zero_grad()
         loss_d = self.training_step_d(batch)
         self.manual_backward(loss_d)
+        if grad_clip is not None:
+            d_params = list(self.model_d.parameters())
+            if self.model_d_wavlm is not None:
+                d_params = d_params + list(self.model_d_wavlm.parameters())
+            torch.nn.utils.clip_grad_norm_(d_params, grad_clip)
         opt_d.step()
 
         # Clear instance variables to release references
@@ -438,7 +477,9 @@ class VitsModel(pl.LightningModule):
                 # Use info level only for first cleanup, then debug
                 if batch_idx == 0:
                     _LOGGER.info(
-                        f"Memory cache clearing enabled every {MEMORY_CLEANUP_FREQUENCY} iterations"
+                        "D:G ratio = %d:1 | Memory cache clearing every %d iterations",
+                        d_update_interval,
+                        MEMORY_CLEANUP_FREQUENCY,
                     )
                 else:
                     _LOGGER.debug(f"Memory cache cleared at iteration {batch_idx}")
@@ -490,7 +531,7 @@ class VitsModel(pl.LightningModule):
             _,
             spec,
             spec_lengths,
-            speaker_ids,
+            _speaker_ids,
             language_ids,
             prosody_features,
         ) = (
@@ -504,6 +545,17 @@ class VitsModel(pl.LightningModule):
             batch.language_ids if batch.language_ids is not None else None,
             batch.prosody_features if batch.prosody_features is not None else None,
         )
+        speaker_embeddings = (
+            batch.speaker_embeddings if batch.speaker_embeddings is not None else None
+        )
+
+        # Speaker embedding perturbation for zero-shot generalization
+        # (sigma=0.05 improves robustness to unseen speaker embeddings at inference)
+        if self.training and speaker_embeddings is not None:
+            speaker_embeddings = (
+                speaker_embeddings + torch.randn_like(speaker_embeddings) * 0.05
+            )
+
         (
             y_hat,
             l_length,
@@ -517,9 +569,10 @@ class VitsModel(pl.LightningModule):
             x_lengths,
             spec,
             spec_lengths,
-            speaker_ids,
+            None,  # sid=None: emb_g disabled, spk_proj is the sole speaker conditioning path
             lid=language_ids,
             prosody_features=prosody_features,
+            speaker_embeddings=speaker_embeddings,
         )
         self._y_hat = y_hat.contiguous()
 
@@ -572,11 +625,30 @@ class VitsModel(pl.LightningModule):
 
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
 
-            # WavLM Discriminator loss (optional, computed every N steps)
-            if self.model_d_wavlm is not None and (
-                self.global_step % self.hparams.wavlm_every_n_steps == 0
+            # Mel Speaker Consistency Loss (differentiable, multi-speaker only)
+            # Used as fallback when CAM++ speaker encoder is not available
+            if (
+                self.hparams.num_speakers > 1
+                and self.hparams.c_spk > 0
+                and self.speaker_encoder is None
             ):
-                _y_d_hat_r_wlm, y_d_hat_g_wlm, fmap_r_wlm, fmap_g_wlm = (
+                loss_spk = mel_speaker_consistency_loss(
+                    y_hat,
+                    y,
+                    n_fft=self.hparams.filter_length,
+                    n_mels=self.hparams.mel_channels,
+                    hop_length=self.hparams.hop_length,
+                    win_length=self.hparams.win_length,
+                    sample_rate=self.hparams.sample_rate,
+                    mel_fmin=self.hparams.mel_fmin,
+                    mel_fmax=self.hparams.mel_fmax,
+                )
+                loss_gen_all = loss_gen_all + loss_spk * self.hparams.c_spk
+                self._log_with_batch_info("loss_spk", loss_spk, batch)
+
+            # WavLM Discriminator loss (optional)
+            if self.model_d_wavlm is not None:
+                y_d_hat_r_wlm, y_d_hat_g_wlm, fmap_r_wlm, fmap_g_wlm = (
                     self.model_d_wavlm(y, y_hat)
                 )
                 loss_fm_wavlm = feature_loss(fmap_r_wlm, fmap_g_wlm)
@@ -700,22 +772,30 @@ class VitsModel(pl.LightningModule):
                             text_lengths = torch.LongTensor(
                                 [len(test_utt.phoneme_ids)]
                             ).to(self.device)
-                            scales = [0.667, 1.0, 0.8]
-                            # speaker_id / language_id may be int or Tensor
-                            # (Subset from random_split wraps them as LongTensor)
-                            raw_sid = test_utt.speaker_id
-                            if raw_sid is not None:
-                                if isinstance(raw_sid, torch.Tensor):
-                                    sid = (
-                                        raw_sid.unsqueeze(0)
-                                        if raw_sid.dim() == 0
-                                        else raw_sid
+                            scales = [0.4, 1.0, 0.5]
+
+                            # Resolve speaker embedding for zero-shot
+                            spk_emb = None
+                            if (
+                                self.hparams.get("use_zero_shot", True)
+                                and self.hparams.num_speakers > 1
+                            ):
+                                if (
+                                    hasattr(test_utt, "speaker_embedding")
+                                    and test_utt.speaker_embedding is not None
+                                ):
+                                    spk_emb = test_utt.speaker_embedding.unsqueeze(
+                                        0
                                     ).to(self.device)
                                 else:
-                                    sid = torch.LongTensor([raw_sid]).to(self.device)
-                            else:
-                                sid = None
+                                    spk_emb = torch.zeros(
+                                        1,
+                                        self.hparams.get("spk_embed_dim", 192),
+                                        device=self.device,
+                                    )
 
+                            # language_id may be int or Tensor
+                            # (Subset from random_split wraps them as LongTensor)
                             raw_lid = test_utt.language_id
                             if raw_lid is not None:
                                 if isinstance(raw_lid, torch.Tensor):
@@ -729,9 +809,18 @@ class VitsModel(pl.LightningModule):
                             else:
                                 lid = None
 
-                            test_audio = self(
-                                text, text_lengths, scales, sid=sid, lid=lid
-                            ).detach()
+                            noise_scale, length_scale, noise_scale_w = scales
+                            test_audio, *_ = self.model_g.infer(
+                                text,
+                                text_lengths,
+                                sid=None,
+                                lid=lid,
+                                noise_scale=noise_scale,
+                                length_scale=length_scale,
+                                noise_scale_w=noise_scale_w,
+                                speaker_embeddings=spk_emb,
+                            )
+                            test_audio = test_audio.detach()
                             test_audio = test_audio * (
                                 1.0 / max(0.01, abs(test_audio.max()))
                             )
@@ -744,7 +833,7 @@ class VitsModel(pl.LightningModule):
                                 test_utt.text if test_utt.text else f"sample_{utt_idx}"
                             )
                             speaker_str = (
-                                f"spk={sid.item()}" if sid is not None else "single"
+                                "zero-shot" if spk_emb is not None else "single"
                             )
                             lang_str = language_map.get(
                                 lid.item() if lid is not None else 0, "unknown"
@@ -771,7 +860,7 @@ class VitsModel(pl.LightningModule):
                             )
 
                             # Aggressive per-sample GPU memory cleanup
-                            del test_audio, text, text_lengths, sid, lid
+                            del test_audio, text, text_lengths, spk_emb, lid
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
                                 torch.cuda.empty_cache()
@@ -812,21 +901,18 @@ class VitsModel(pl.LightningModule):
             torch.distributed.barrier()
 
     def configure_optimizers(self):
-        # Freeze Duration Predictor if requested
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+        # Freeze Duration Predictor parameters if requested
         freeze_dp = getattr(self.hparams, "freeze_dp", False)
         if freeze_dp:
-            dp_frozen_count = 0
             for name, param in self.model_g.named_parameters():
                 if name.startswith("dp."):
                     param.requires_grad = False
-                    dp_frozen_count += 1
-            _LOGGER.info(
-                "Frozen %d Duration Predictor parameters (--freeze-dp)",
-                dp_frozen_count,
-            )
+            _LOGGER.info("Froze Duration Predictor parameters (--freeze-dp)")
 
-        # Generator optimizer: only trainable parameters
-        gen_params = [p for p in self.model_g.parameters() if p.requires_grad]
+        # Collect generator parameters (exclude frozen DP params when freeze_dp)
+        g_params = [p for p in self.model_g.parameters() if p.requires_grad]
 
         # Collect discriminator parameters (including WavLM if enabled)
         d_params = list(self.model_d.parameters())
@@ -835,7 +921,7 @@ class VitsModel(pl.LightningModule):
 
         optimizers = [
             torch.optim.AdamW(
-                gen_params,
+                g_params,
                 lr=self.hparams.learning_rate,
                 betas=self.hparams.betas,
                 eps=self.hparams.eps,
@@ -849,14 +935,42 @@ class VitsModel(pl.LightningModule):
                 fused=torch.cuda.is_available(),
             ),
         ]
-        schedulers = [
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers[0], gamma=self.hparams.lr_decay
-            ),
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers[1], gamma=self.hparams.lr_decay
-            ),
-        ]
+
+        # --- LR Schedule: Warmup + Cosine Annealing ---
+        max_epochs = None
+        try:
+            max_epochs = self.trainer.max_epochs
+        except RuntimeError:
+            pass
+        if not max_epochs:
+            max_epochs = self.hparams.get("max_epochs", 200)
+        warmup_epochs = self.hparams.warmup_epochs
+        eta_min = 1e-6
+
+        schedulers = []
+        for opt in optimizers:
+            if warmup_epochs > 0 and warmup_epochs < max_epochs:
+                warmup = LinearLR(opt, start_factor=0.01, total_iters=warmup_epochs)
+                cosine = CosineAnnealingLR(
+                    opt, T_max=max_epochs - warmup_epochs, eta_min=eta_min
+                )
+                scheduler = SequentialLR(
+                    opt,
+                    schedulers=[warmup, cosine],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                scheduler = CosineAnnealingLR(opt, T_max=max_epochs, eta_min=eta_min)
+            schedulers.append(scheduler)
+
+        _LOGGER.info(
+            "LR schedule: %s warmup epochs + cosine annealing over %d total epochs "
+            "(eta_min=%.1e, base_lr=%.1e)",
+            warmup_epochs if warmup_epochs > 0 else "no",
+            max_epochs,
+            eta_min,
+            self.hparams.learning_rate,
+        )
 
         return optimizers, schedulers
 
@@ -907,5 +1021,12 @@ class VitsModel(pl.LightningModule):
             default=2,
             help="Number of workers for DataLoader (default: 2 for parallel data loading). "
             "Set to 0 for single-threaded loading if shared memory is limited.",
+        )
+        parser.add_argument(
+            "--c-spk",
+            type=float,
+            default=1.0,
+            help="Weight for mel speaker consistency loss (default: 1.0). "
+            "Active only for multi-speaker models. Set to 0 to disable.",
         )
         return parent_parser

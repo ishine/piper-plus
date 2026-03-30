@@ -3,6 +3,7 @@ import argparse
 import logging
 import pathlib
 import platform
+import warnings
 from pathlib import Path
 
 import torch
@@ -23,6 +24,34 @@ if platform.system() == "Windows":
 _LOGGER = logging.getLogger("piper_train.export_onnx")
 
 OPSET_VERSION = 15
+
+
+def _strip_orig_mod(state_dict: dict) -> tuple[dict, int]:
+    """Remove ``._orig_mod.`` inserted by ``torch.compile`` from state_dict keys.
+
+    When a checkpoint is saved while ``torch.compile`` is active, parameter keys
+    get an ``_orig_mod`` prefix (e.g. ``model_g.dec._orig_mod.conv_pre.weight``).
+    ``load_from_checkpoint(strict=False)`` silently ignores these mismatched keys,
+    leaving weights uninitialised.  This helper strips the prefix so the weights
+    can be loaded correctly.
+
+    Returns ``(cleaned_dict, n_stripped)``.  The original dict is not mutated.
+    Only keys that actually contain ``._orig_mod.`` are renamed; others are
+    passed through unchanged.
+    """
+    cleaned: dict = {}
+    n_stripped = 0
+    for key, value in state_dict.items():
+        new_key = key.replace("._orig_mod.", ".")
+        if new_key != key:
+            n_stripped += 1
+        cleaned[new_key] = value
+    if n_stripped > 0:
+        _LOGGER.info(
+            "Stripped '_orig_mod' prefix from %d state_dict keys (torch.compile artifact)",
+            n_stripped,
+        )
+    return cleaned, n_stripped
 
 
 def should_unify_emb_lang(
@@ -184,6 +213,15 @@ def main() -> None:
         default=0,
         help="Source language index for emb_lang unification (default: 0).",
     )
+    parser.add_argument(
+        "--export-mode",
+        choices=["auto", "zero-shot", "sid"],
+        default="auto",
+        help="Export mode. 'auto': auto-detect (zero-shot for multi-speaker). "
+        "'zero-shot': speaker embedding input. "
+        "'sid': DEPRECATED, falls back to zero-shot with warning. "
+        "Default: auto.",
+    )
     args = parser.parse_args()
 
     if args.debug:
@@ -192,6 +230,17 @@ def main() -> None:
         logging.basicConfig(level=logging.INFO)
 
     _LOGGER.debug(args)
+
+    # Handle deprecated --export-mode sid
+    if args.export_mode == "sid":
+        warnings.warn(
+            "--export-mode sid is deprecated (emb_g has been removed). "
+            "Falling back to zero-shot mode. Use --export-mode auto or "
+            "--export-mode zero-shot instead.",
+            DeprecationWarning,
+            stacklevel=1,
+        )
+        args.export_mode = "zero-shot"
 
     # -------------------------------------------------------------------------
 
@@ -211,9 +260,30 @@ def main() -> None:
     model = VitsModel.load_from_checkpoint(args.checkpoint, dataset=None, strict=False)
     model_g = model.model_g
 
+    # Load raw checkpoint for _orig_mod stripping and EMA application.
+    # Must happen early: _orig_mod fix restores weights that load_from_checkpoint
+    # silently missed, and EMA must be applied BEFORE remove_weight_norm().
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+
+    # Fix torch.compile artifact: strip _orig_mod prefix from state_dict keys.
+    # When torch.compile is active during checkpoint save, keys get prefixed with
+    # _orig_mod (e.g. model_g.dec._orig_mod.conv_pre.weight).  strict=False above
+    # silently ignores these, leaving weights uninitialised.
+    raw_sd = ckpt.get("state_dict", {})
+    cleaned_sd, n_stripped = _strip_orig_mod(raw_sd)
+    if n_stripped > 0:
+        missing, unexpected = model.load_state_dict(cleaned_sd, strict=False)
+        if missing:
+            _LOGGER.debug("Keys still missing after _orig_mod strip: %d", len(missing))
+        if unexpected:
+            _LOGGER.debug("Unexpected keys after _orig_mod strip: %d", len(unexpected))
+
     num_symbols = model_g.n_vocab
     num_speakers = model_g.n_speakers
     num_languages = getattr(model_g, "n_languages", 1)
+
+    # Determine if model has spk_proj (zero-shot capable)
+    has_spk_proj = hasattr(model_g, "spk_proj")
 
     # Enable ONNX export mode for deterministic output
     model_g.onnx_export_mode = True
@@ -239,11 +309,12 @@ def main() -> None:
             num_languages,
         )
 
-    # Apply EMA weights to decoder if available (always applied when present)
+    # Apply EMA weights to decoder and spk_proj if available (always applied when present)
     # IMPORTANT: EMA must be applied BEFORE remove_weight_norm(), because EMA shadow
     # params use weight_g/weight_v keys. remove_weight_norm() fuses them into a single
     # "weight" tensor, making EMA keys unmatchable.
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+
+    # --- EMA decoder ---
     ema_state = ckpt.get("ema_generator_state")
     if ema_state and "shadow_params" in ema_state:
         applied = 0
@@ -265,6 +336,30 @@ def main() -> None:
             _LOGGER.warning("EMA state found but no matching decoder parameters")
     else:
         _LOGGER.info("No EMA state found in checkpoint, skipping EMA")
+
+    # --- EMA spk_proj ---
+    ema_spk_proj_state = ckpt.get("ema_spk_proj_state")
+    if ema_spk_proj_state and "shadow_params" in ema_spk_proj_state and has_spk_proj:
+        applied = 0
+        skipped = 0
+        spk_proj_params = dict(model_g.spk_proj.named_parameters())
+        for name, shadow_param in ema_spk_proj_state["shadow_params"].items():
+            if name in spk_proj_params:
+                spk_proj_params[name].data.copy_(shadow_param)
+                applied += 1
+            else:
+                skipped += 1
+        if applied > 0:
+            _LOGGER.info(
+                "Applied EMA weights to spk_proj: %d parameters (skipped %d)",
+                applied,
+                skipped,
+            )
+        else:
+            _LOGGER.warning("EMA spk_proj state found but no matching parameters")
+    elif has_spk_proj:
+        _LOGGER.info("No EMA spk_proj state found in checkpoint, skipping")
+
     del ckpt
 
     with torch.no_grad():
@@ -273,21 +368,53 @@ def main() -> None:
     # Check if model uses prosody features
     has_prosody = getattr(model_g, "prosody_dim", 0) > 0
 
+    # Determine zero-shot mode:
+    # - auto: use zero-shot if multi-speaker AND spk_proj exists
+    # - zero-shot: force zero-shot (requires spk_proj)
+    if args.export_mode == "zero-shot":
+        use_zero_shot = True
+        if not has_spk_proj:
+            _LOGGER.error(
+                "Cannot use --export-mode zero-shot: model does not have spk_proj. "
+                "This model may be an older architecture without speaker embedding support."
+            )
+            return
+    else:
+        # auto mode: zero-shot for multi-speaker models with spk_proj
+        use_zero_shot = num_speakers > 1 and has_spk_proj
+
+    if use_zero_shot:
+        _LOGGER.info(
+            "Zero-shot mode: model will accept speaker_embedding [batch, 192] input"
+        )
+
     stochastic = args.stochastic
 
     def infer_forward(
-        text, text_lengths, scales, sid=None, lid=None, prosody_features=None
+        text,
+        text_lengths,
+        scales,
+        speaker_embedding=None,
+        lid=None,
+        prosody_features=None,
     ):
         """
         Efficient forward function that returns both audio and duration information.
         The duration predictor is called once to compute both durations and audio output.
+
+        For multi-speaker models, speaker_embedding (float32 [batch, 192]) is used
+        with spk_proj MLP to compute global conditioning.
         """
         # noise_scale = scales[0]  # unused in ONNX export (deterministic mode)
         length_scale = scales[1]
         noise_scale_w = scales[2]
 
         # 1. Global conditioning (must be computed before enc_p)
-        g = model_g._get_global_conditioning(sid, lid)
+        # spk_proj-only: pass speaker_embedding through _get_global_conditioning
+        # which uses spk_proj MLP instead of emb_g
+        g = model_g._get_global_conditioning(
+            sid=None, lid=lid, speaker_embeddings=speaker_embedding
+        )
 
         # 2. Encoder (with global conditioning for cond_layer)
         x, m_p, logs_p, x_mask = model_g.enc_p(text, text_lengths, g=g)
@@ -340,15 +467,13 @@ def main() -> None:
 
     # Determine which optional inputs to include.
     # These flags control BOTH dummy_input and input_names so they stay in sync.
-    include_sid = num_speakers > 1 or num_languages > 1
+    include_speaker_embedding = use_zero_shot
     include_lid = num_languages > 1
 
-    sid: torch.LongTensor | None = None
-    if include_sid:
-        # Multi-speaker: real speaker ID needed.
-        # Single-speaker multilingual: sid=0 placeholder to maintain correct
-        # positional argument order in infer_forward (sid before lid).
-        sid = torch.LongTensor([0])
+    speaker_embedding: torch.Tensor | None = None
+    if include_speaker_embedding:
+        # Zero-shot: 192-dim speaker embedding from CAM++ encoder
+        speaker_embedding = torch.zeros(1, 192, dtype=torch.float32)
 
     lid: torch.LongTensor | None = None
     if include_lid:
@@ -373,10 +498,10 @@ def main() -> None:
         "durations": {0: "batch_size", 1: "phonemes"},
     }
 
-    if include_sid:
-        dummy_input_list.append(sid)
-        input_names.append("sid")
-        dynamic_axes["sid"] = {0: "batch_size"}
+    if include_speaker_embedding:
+        dummy_input_list.append(speaker_embedding)
+        input_names.append("speaker_embedding")
+        dynamic_axes["speaker_embedding"] = {0: "batch_size"}
     if include_lid:
         dummy_input_list.append(lid)
         input_names.append("lid")
@@ -408,7 +533,10 @@ def main() -> None:
     )
 
     mode = "stochastic" if args.stochastic else "deterministic"
-    _LOGGER.info("Exported model to %s (mode: %s)", args.output, mode)
+    export_type = "zero-shot" if use_zero_shot else "single-speaker"
+    _LOGGER.info(
+        "Exported model to %s (mode: %s, type: %s)", args.output, mode, export_type
+    )
 
     # Apply ONNX simplification if requested
     # Skip simplification for prosody models to avoid numerical precision issues
