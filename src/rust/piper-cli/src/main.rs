@@ -663,10 +663,8 @@ fn main() -> Result<()> {
             if let Some(sid) = cli.speaker {
                 request.speaker_id = Some(sid);
             }
-            if request.speaker_embedding.is_none() {
-                if let Some(ref emb) = speaker_embedding {
-                    request.speaker_embedding = Some(emb.clone());
-                }
+            if request.speaker_embedding.is_none() && speaker_embedding.is_some() {
+                request.speaker_embedding = speaker_embedding.clone();
             }
 
             // 推論実行
