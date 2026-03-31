@@ -153,6 +153,7 @@ fn auto_detect_device() -> DeviceType {
 /// Always includes CPU. Checks for CUDA/CoreML/DirectML/TensorRT availability
 /// based on enabled features.
 pub fn list_devices() -> Vec<DeviceInfo> {
+    #[allow(clippy::vec_init_then_push)]
     let mut devices = Vec::new();
 
     // CPU is always available

@@ -723,10 +723,7 @@ fn load_speaker_embedding(path: &std::path::Path) -> Result<Vec<f32>> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Cannot open speaker embedding: {}", path.display()))?;
 
-    let embedding: Vec<f32> = if bytes.len() >= 6
-        && bytes[0] == 0x93
-        && bytes[1..6] == *b"NUMPY"
-    {
+    let embedding: Vec<f32> = if bytes.len() >= 6 && bytes[0] == 0x93 && bytes[1..6] == *b"NUMPY" {
         // NumPy .npy v1.0 format
         let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
         let data_offset = 6 + 2 + 2 + header_len;

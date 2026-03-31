@@ -218,6 +218,7 @@ impl PiperVoice {
     ///
     /// `language_override` を指定すると、phonemizer の自動検出を上書きして
     /// 指定言語の language_id を使用する。多言語モデルで特定言語を強制する場合に使用。
+    #[allow(clippy::too_many_arguments)]
     pub fn synthesize_text(
         &mut self,
         text: &str,
@@ -316,7 +317,8 @@ impl PiperVoice {
         speaker_id: Option<i64>,
         speaker_embedding: Option<Vec<f32>>,
     ) -> Result<SynthesisResult, PiperError> {
-        let result = self.synthesize_text(text, speaker_id, speaker_embedding, None, 0.667, 1.0, 0.8)?;
+        let result =
+            self.synthesize_text(text, speaker_id, speaker_embedding, None, 0.667, 1.0, 0.8)?;
         crate::audio::write_wav(output, result.sample_rate, &result.audio)?;
         Ok(result)
     }

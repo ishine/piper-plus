@@ -380,7 +380,12 @@ impl PiperVoice {
 
         let result = py.allow_threads(move || {
             let inner = unsafe { inner_ptr.as_mut() };
-            inner.text_to_wav_file(&text_owned, Path::new(&output_owned), speaker_id, speaker_embedding)
+            inner.text_to_wav_file(
+                &text_owned,
+                Path::new(&output_owned),
+                speaker_id,
+                speaker_embedding,
+            )
         });
 
         Ok(result.map_err(piper_err_to_pyerr)?.into())

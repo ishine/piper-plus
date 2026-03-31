@@ -246,6 +246,7 @@ impl std::fmt::Display for DeviceSelection {
 pub fn enumerate_devices() -> &'static [DeviceInfo] {
     static DEVICES: OnceLock<Vec<DeviceInfo>> = OnceLock::new();
     DEVICES.get_or_init(|| {
+        #[allow(clippy::vec_init_then_push)]
         let mut devices = Vec::new();
 
         // CPU is always available
