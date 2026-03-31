@@ -480,6 +480,9 @@ void loadModel(std::string modelPath, ModelSession &session, bool useCuda, int g
     } else if (name == "sid") {
       session.hasMultiSpeaker = true;
       spdlog::debug("Model supports multi-speaker (sid input)");
+    } else if (name == "speaker_embedding") {
+      session.hasSpeakerEmbedding = true;
+      spdlog::debug("Model supports zero-shot speaker embedding");
     } else if (name == "lid") {
       session.hasLidInput = true;
       spdlog::debug("Model supports language ID (lid input)");
@@ -671,13 +674,36 @@ void synthesize(std::vector<PhonemeId> &phonemeIds,
   // Build input names dynamically based on model capabilities
   std::vector<const char *> inputNamesVec = {"input", "input_lengths", "scales"};
 
-  // Add speaker id only for multi-speaker models
+  // Speaker conditioning: speaker_embedding takes priority over sid
   // NOTE: These must be kept outside the "if" below to avoid being deallocated.
   std::vector<int64_t> speakerId{
       (int64_t)synthesisConfig.speakerId.value_or(0)};
   std::vector<int64_t> speakerIdShape{(int64_t)speakerId.size()};
 
-  if (session.hasMultiSpeaker) {
+  const int64_t speakerEmbeddingDim = 192;
+  std::vector<float> speakerEmbeddingData;
+  std::vector<int64_t> speakerEmbeddingShape{1, speakerEmbeddingDim};
+
+  if (session.hasSpeakerEmbedding) {
+    // Zero-shot model: use speaker_embedding float tensor [1, 192]
+    if (synthesisConfig.speakerEmbedding.has_value() &&
+        !synthesisConfig.speakerEmbedding->empty()) {
+      speakerEmbeddingData = synthesisConfig.speakerEmbedding.value();
+      if ((int64_t)speakerEmbeddingData.size() != speakerEmbeddingDim) {
+        spdlog::warn("Speaker embedding has {} values, expected {}; padding/truncating",
+                     speakerEmbeddingData.size(), speakerEmbeddingDim);
+        speakerEmbeddingData.resize(speakerEmbeddingDim, 0.0f);
+      }
+    } else {
+      spdlog::warn("Model expects speaker_embedding but none provided; using zeros");
+      speakerEmbeddingData.resize(speakerEmbeddingDim, 0.0f);
+    }
+    inputTensors.push_back(Ort::Value::CreateTensor<float>(
+        memoryInfo, speakerEmbeddingData.data(), speakerEmbeddingData.size(),
+        speakerEmbeddingShape.data(), speakerEmbeddingShape.size()));
+    inputNamesVec.push_back("speaker_embedding");
+  } else if (session.hasMultiSpeaker) {
+    // Traditional multi-speaker model: use sid int64 tensor
     inputTensors.push_back(Ort::Value::CreateTensor<int64_t>(
         memoryInfo, speakerId.data(), speakerId.size(), speakerIdShape.data(),
         speakerIdShape.size()));
@@ -685,7 +711,7 @@ void synthesize(std::vector<PhonemeId> &phonemeIds,
   }
 
   // Add language id for multilingual models
-  // ONNX input order: ... -> sid -> lid -> prosody_features
+  // ONNX input order: ... -> speaker_embedding/sid -> lid -> prosody_features
   // NOTE: Must be declared outside "if" to prevent deallocation before Run().
   auto lid = synthesisConfig.languageId.value_or(0);
   if (voice && (lid < 0 || lid >= voice->modelConfig.numLanguages)) {

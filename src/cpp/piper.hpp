@@ -68,6 +68,9 @@ struct SynthesisConfig {
   // Speaker id from 0 to numSpeakers - 1
   std::optional<SpeakerId> speakerId;
 
+  // Speaker embedding for zero-shot TTS [192 floats]
+  std::optional<std::vector<float>> speakerEmbedding;
+
   // Language id from 0 to numLanguages - 1
   std::optional<LanguageId> languageId;
 
@@ -95,6 +98,7 @@ struct ModelSession {
   bool hasDurationOutput = false;  // Whether model outputs duration information
   bool hasProsodyInput = false;    // Whether model accepts prosody_features input
   bool hasMultiSpeaker = false;    // Whether model has sid (speaker ID) input
+  bool hasSpeakerEmbedding = false; // Whether model has speaker_embedding input (zero-shot)
   bool hasLidInput = false;        // Whether model has lid (language ID) input
 
   ModelSession() : onnx(nullptr){};

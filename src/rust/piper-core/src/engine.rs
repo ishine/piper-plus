@@ -20,6 +20,7 @@ pub struct SynthesisRequest {
     pub phoneme_ids: Vec<i64>,
     pub prosody_features: Option<Vec<[i32; 3]>>,
     pub speaker_id: Option<i64>,
+    pub speaker_embedding: Option<Vec<f32>>,
     pub language_id: Option<i64>,
     pub noise_scale: f32,
     pub length_scale: f32,
@@ -32,6 +33,7 @@ impl Default for SynthesisRequest {
             phoneme_ids: Vec::new(),
             prosody_features: None,
             speaker_id: None,
+            speaker_embedding: None,
             language_id: None,
             noise_scale: 0.667,
             length_scale: 1.0,
@@ -68,6 +70,7 @@ impl SynthesisResult {
 #[derive(Debug, Clone)]
 pub struct ModelCapabilities {
     pub has_sid: bool,
+    pub has_spk_emb: bool,
     pub has_lid: bool,
     pub has_prosody: bool,
     pub has_duration_output: bool,
@@ -121,6 +124,7 @@ impl OnnxEngine {
 
         let capabilities = ModelCapabilities {
             has_sid: has_input("sid"),
+            has_spk_emb: has_input("speaker_embedding"),
             has_lid: has_input("lid"),
             has_prosody: has_input("prosody_features"),
             has_duration_output: has_output("durations"),
@@ -132,8 +136,9 @@ impl OnnxEngine {
             output_names,
         );
         tracing::info!(
-            "Capabilities: sid={}, lid={}, prosody={}, durations={}",
+            "Capabilities: sid={}, spk_emb={}, lid={}, prosody={}, durations={}",
             capabilities.has_sid,
+            capabilities.has_spk_emb,
             capabilities.has_lid,
             capabilities.has_prosody,
             capabilities.has_duration_output,
@@ -162,9 +167,10 @@ impl OnnxEngine {
     /// 1. `input` (phoneme_ids): int64 \[1, phoneme_length\]
     /// 2. `input_lengths`: int64 \[1\]
     /// 3. `scales`: float32 \[3\] = \[noise_scale, length_scale, noise_w\]
-    /// 4. `sid` (条件付き): int64 \[1\] -- has_sid が true のとき
-    /// 5. `lid` (条件付き): int64 \[1\] -- has_lid が true のとき
-    /// 6. `prosody_features` (条件付き): int64 \[1, phoneme_length, 3\]
+    /// 4. `speaker_embedding` (条件付き): float32 \[1, 192\] -- has_spk_emb が true のとき
+    /// 5. `sid` (条件付き): int64 \[1\] -- has_sid が true かつ speaker_embedding が無いとき
+    /// 6. `lid` (条件付き): int64 \[1\] -- has_lid が true のとき
+    /// 7. `prosody_features` (条件付き): int64 \[1, phoneme_length, 3\]
     ///
     /// ONNX 出力:
     /// - `output`: float32 \[1, 1, audio_samples\]
@@ -201,9 +207,34 @@ impl OnnxEngine {
         ))
         .map_err(|e| PiperError::Inference(format!("scales tensor: {e}")))?;
 
-        // 4. sid: int64 [1] (条件付き)
+        // 4. speaker_embedding: float32 [1, 192] (条件付き — sid より優先)
+        const SPK_EMB_DIM: usize = 192;
+        let spk_emb_tensor = if self.capabilities.has_spk_emb {
+            let mut emb = if let Some(ref e) = request.speaker_embedding {
+                e.clone()
+            } else {
+                tracing::warn!("Model expects speaker_embedding but none provided; using zeros");
+                vec![0.0f32; SPK_EMB_DIM]
+            };
+            if emb.len() != SPK_EMB_DIM {
+                tracing::warn!(
+                    "Speaker embedding has {} values, expected {}; padding/truncating",
+                    emb.len(),
+                    SPK_EMB_DIM
+                );
+                emb.resize(SPK_EMB_DIM, 0.0);
+            }
+            Some(
+                Tensor::from_array(([1_usize, SPK_EMB_DIM], emb.into_boxed_slice()))
+                    .map_err(|e| PiperError::Inference(format!("speaker_embedding tensor: {e}")))?,
+            )
+        } else {
+            None
+        };
+
+        // 5. sid: int64 [1] (条件付き — speaker_embedding が無い場合のフォールバック)
         let sid_val = request.speaker_id.unwrap_or(0);
-        let sid_tensor = if self.capabilities.has_sid {
+        let sid_tensor = if !self.capabilities.has_spk_emb && self.capabilities.has_sid {
             Some(
                 Tensor::from_array(([1_usize], vec![sid_val].into_boxed_slice()))
                     .map_err(|e| PiperError::Inference(format!("sid tensor: {e}")))?,
@@ -212,7 +243,7 @@ impl OnnxEngine {
             None
         };
 
-        // 5. lid: int64 [1] (条件付き)
+        // 6. lid: int64 [1] (条件付き)
         let lid_val = request.language_id.unwrap_or(0);
         let lid_tensor = if self.capabilities.has_lid {
             Some(
@@ -223,7 +254,7 @@ impl OnnxEngine {
             None
         };
 
-        // 6. prosody_features: int64 [1, phoneme_len, 3] (条件付き)
+        // 7. prosody_features: int64 [1, phoneme_len, 3] (条件付き)
         let prosody_tensor = if self.capabilities.has_prosody {
             let flat: Vec<i64> = if let Some(ref features) = request.prosody_features {
                 features
@@ -251,6 +282,9 @@ impl OnnxEngine {
         inputs.push(("input_lengths".into(), (&lengths_tensor).into()));
         inputs.push(("scales".into(), (&scales_tensor).into()));
 
+        if let Some(ref t) = spk_emb_tensor {
+            inputs.push(("speaker_embedding".into(), t.into()));
+        }
         if let Some(ref t) = sid_tensor {
             inputs.push(("sid".into(), t.into()));
         }
@@ -364,6 +398,7 @@ mod tests {
     fn test_model_capabilities_debug() {
         let caps = ModelCapabilities {
             has_sid: true,
+            has_spk_emb: false,
             has_lid: false,
             has_prosody: true,
             has_duration_output: false,
@@ -420,6 +455,7 @@ mod tests {
                 [13, 14, 15],
             ]),
             speaker_id: Some(42),
+            speaker_embedding: None,
             language_id: Some(3),
             noise_scale: 0.333,
             length_scale: 1.5,
@@ -440,6 +476,7 @@ mod tests {
     fn test_model_capabilities_all_true() {
         let caps = ModelCapabilities {
             has_sid: true,
+            has_spk_emb: false,
             has_lid: true,
             has_prosody: true,
             has_duration_output: true,
@@ -454,6 +491,7 @@ mod tests {
     fn test_model_capabilities_all_false() {
         let caps = ModelCapabilities {
             has_sid: false,
+            has_spk_emb: false,
             has_lid: false,
             has_prosody: false,
             has_duration_output: false,

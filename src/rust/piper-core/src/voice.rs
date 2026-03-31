@@ -222,6 +222,7 @@ impl PiperVoice {
         &mut self,
         text: &str,
         speaker_id: Option<i64>,
+        speaker_embedding: Option<Vec<f32>>,
         language_override: Option<&str>,
         noise_scale: f32,
         length_scale: f32,
@@ -275,6 +276,7 @@ impl PiperVoice {
             phoneme_ids: ids,
             prosody_features: prosody_tensor,
             speaker_id,
+            speaker_embedding,
             language_id,
             noise_scale,
             length_scale,
@@ -312,8 +314,9 @@ impl PiperVoice {
         text: &str,
         output: &Path,
         speaker_id: Option<i64>,
+        speaker_embedding: Option<Vec<f32>>,
     ) -> Result<SynthesisResult, PiperError> {
-        let result = self.synthesize_text(text, speaker_id, None, 0.667, 1.0, 0.8)?;
+        let result = self.synthesize_text(text, speaker_id, speaker_embedding, None, 0.667, 1.0, 0.8)?;
         crate::audio::write_wav(output, result.sample_rate, &result.audio)?;
         Ok(result)
     }
@@ -732,6 +735,7 @@ mod tests {
             phoneme_ids: ids.clone(),
             prosody_features: None,
             speaker_id: Some(0),
+            speaker_embedding: None,
             language_id: None,
             noise_scale: 0.667,
             length_scale: 1.0,
@@ -750,6 +754,7 @@ mod tests {
             phoneme_ids: vec![1, 2, 3],
             prosody_features: Some(prosody_feats.clone()),
             speaker_id: Some(3),
+            speaker_embedding: None,
             language_id: Some(0),
             noise_scale: 0.5,
             length_scale: 1.2,
@@ -767,6 +772,7 @@ mod tests {
             phoneme_ids: vec![1, 5, 10, 20],
             prosody_features: None,
             speaker_id: Some(100),
+            speaker_embedding: None,
             language_id: Some(2), // zh
             noise_scale: 0.667,
             length_scale: 1.0,

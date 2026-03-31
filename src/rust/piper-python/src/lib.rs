@@ -223,6 +223,8 @@ impl PiperVoice {
     /// Args:
     ///     text: Input text to synthesize.
     ///     speaker_id: Speaker index for multi-speaker models (default: None).
+    ///     speaker_embedding: 192-dimensional speaker embedding for zero-shot TTS (default: None).
+    ///         When provided and the model supports it, takes priority over speaker_id.
     ///     language: Language code override (e.g. ``"ja"``, ``"en"``).
     ///         If omitted, the phonemizer auto-detects the language.
     ///     noise_scale: Noise scale for VITS stochastic synthesis (default: 0.667).
@@ -236,12 +238,13 @@ impl PiperVoice {
     ///     ValueError: If the text produces unknown phonemes.
     ///     RuntimeError: If ONNX inference fails.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (text, speaker_id=None, language=None, noise_scale=0.667, length_scale=1.0, noise_w=0.8))]
+    #[pyo3(signature = (text, speaker_id=None, speaker_embedding=None, language=None, noise_scale=0.667, length_scale=1.0, noise_w=0.8))]
     fn synthesize(
         &mut self,
         py: Python<'_>,
         text: &str,
         speaker_id: Option<i64>,
+        speaker_embedding: Option<Vec<f32>>,
         language: Option<&str>,
         noise_scale: f32,
         length_scale: f32,
@@ -264,6 +267,7 @@ impl PiperVoice {
             inner.synthesize_text(
                 &text_owned,
                 speaker_id,
+                speaker_embedding,
                 language_owned.as_deref(),
                 noise_scale,
                 length_scale,
@@ -286,6 +290,8 @@ impl PiperVoice {
     /// Args:
     ///     texts: List of input texts to synthesize.
     ///     speaker_id: Speaker index for multi-speaker models (default: None).
+    ///     speaker_embedding: 192-dimensional speaker embedding for zero-shot TTS (default: None).
+    ///         When provided and the model supports it, takes priority over speaker_id.
     ///     language: Language code override (e.g. ``"ja"``, ``"en"``).
     ///         If omitted, the phonemizer auto-detects each text's language.
     ///     noise_scale: Noise scale for VITS stochastic synthesis (default: 0.667).
@@ -299,12 +305,13 @@ impl PiperVoice {
     ///     ValueError: If any text produces unknown phonemes.
     ///     RuntimeError: If ONNX inference fails.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (texts, speaker_id=None, language=None, noise_scale=0.667, length_scale=1.0, noise_w=0.8))]
+    #[pyo3(signature = (texts, speaker_id=None, speaker_embedding=None, language=None, noise_scale=0.667, length_scale=1.0, noise_w=0.8))]
     fn synthesize_batch(
         &mut self,
         py: Python<'_>,
         texts: Vec<String>,
         speaker_id: Option<i64>,
+        speaker_embedding: Option<Vec<f32>>,
         language: Option<String>,
         noise_scale: f32,
         length_scale: f32,
@@ -319,6 +326,7 @@ impl PiperVoice {
                 let r = inner.synthesize_text(
                     text,
                     speaker_id,
+                    speaker_embedding.clone(),
                     language.as_deref(),
                     noise_scale,
                     length_scale,
@@ -348,6 +356,7 @@ impl PiperVoice {
     ///     text: Input text to synthesize.
     ///     output_path: Path for the output WAV file.
     ///     speaker_id: Speaker index for multi-speaker models (default: None).
+    ///     speaker_embedding: 192-dimensional speaker embedding for zero-shot TTS (default: None).
     ///
     /// Returns:
     ///     SynthesisResult with audio metadata (the WAV file is also written).
@@ -355,13 +364,14 @@ impl PiperVoice {
     /// Raises:
     ///     IOError: If the WAV file cannot be written.
     ///     RuntimeError: If ONNX inference fails.
-    #[pyo3(signature = (text, output_path, speaker_id=None))]
+    #[pyo3(signature = (text, output_path, speaker_id=None, speaker_embedding=None))]
     fn synthesize_to_file(
         &mut self,
         py: Python<'_>,
         text: &str,
         output_path: &str,
         speaker_id: Option<i64>,
+        speaker_embedding: Option<Vec<f32>>,
     ) -> PyResult<SynthesisResult> {
         let text_owned = text.to_string();
         let output_owned = output_path.to_string();
@@ -370,7 +380,7 @@ impl PiperVoice {
 
         let result = py.allow_threads(move || {
             let inner = unsafe { inner_ptr.as_mut() };
-            inner.text_to_wav_file(&text_owned, Path::new(&output_owned), speaker_id)
+            inner.text_to_wav_file(&text_owned, Path::new(&output_owned), speaker_id, speaker_embedding)
         });
 
         Ok(result.map_err(piper_err_to_pyerr)?.into())

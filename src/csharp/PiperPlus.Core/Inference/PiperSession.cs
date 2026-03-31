@@ -28,6 +28,11 @@ public record SynthesisResult(short[] Audio, float[]? Durations);
 /// <param name="NoiseScale">Noise scale for the stochastic duration predictor (higher = more variation).</param>
 /// <param name="LengthScale">Length / speed scale (higher = slower speech).</param>
 /// <param name="NoiseW">Noise scale W for the stochastic duration predictor.</param>
+/// <param name="SpeakerEmbedding">
+/// Optional 192-dimensional speaker embedding for zero-shot TTS.
+/// When provided and the model has a <c>speaker_embedding</c> input,
+/// this takes priority over <see cref="SpeakerId"/>.
+/// </param>
 public record SynthesisInput(
     long[] PhonemeIds,
     int SpeakerId = 0,
@@ -35,7 +40,8 @@ public record SynthesisInput(
     long[]? ProsodyFeatures = null,
     float NoiseScale = 0.667f,
     float LengthScale = 1.0f,
-    float NoiseW = 0.8f
+    float NoiseW = 0.8f,
+    float[]? SpeakerEmbedding = null
 );
 
 /// <summary>
@@ -202,12 +208,36 @@ public sealed class PiperSession
             scales, new long[] { 3 });
 
         // Collect names and values in order.
-        var inputNames = new List<string>(5) { "input", "input_lengths", "scales" };
-        var inputValues = new List<OrtValue>(5) { inputTensor, inputLengths, scalesTensor };
+        var inputNames = new List<string>(6) { "input", "input_lengths", "scales" };
+        var inputValues = new List<OrtValue>(6) { inputTensor, inputLengths, scalesTensor };
 
-        // sid (optional): [1]
+        // speaker_embedding (optional): [1, 192] — takes priority over sid
+        const int SpeakerEmbeddingDim = 192;
+        OrtValue? spkEmbTensor = null;
         OrtValue? sidTensor = null;
-        if (_model.HasSpeakerId)
+
+        if (_model.HasSpeakerEmbedding)
+        {
+            float[] embArray;
+            if (input.SpeakerEmbedding is not null && input.SpeakerEmbedding.Length > 0)
+            {
+                embArray = input.SpeakerEmbedding.Length == SpeakerEmbeddingDim
+                    ? input.SpeakerEmbedding
+                    : new float[SpeakerEmbeddingDim];
+                if (input.SpeakerEmbedding.Length != SpeakerEmbeddingDim)
+                    Array.Copy(input.SpeakerEmbedding, embArray,
+                        Math.Min(input.SpeakerEmbedding.Length, SpeakerEmbeddingDim));
+            }
+            else
+            {
+                embArray = new float[SpeakerEmbeddingDim];
+            }
+            spkEmbTensor = OrtValue.CreateTensorValueFromMemory(
+                embArray, new long[] { 1, SpeakerEmbeddingDim });
+            inputNames.Add("speaker_embedding");
+            inputValues.Add(spkEmbTensor);
+        }
+        else if (_model.HasSpeakerId)
         {
             long[] sidArray = new long[] { input.SpeakerId };
             sidTensor = OrtValue.CreateTensorValueFromMemory(sidArray, new long[] { 1 });
@@ -292,6 +322,7 @@ public sealed class PiperSession
         finally
         {
             // Dispose optional tensors that were created outside the using declarations.
+            spkEmbTensor?.Dispose();
             sidTensor?.Dispose();
             lidTensor?.Dispose();
             prosodyTensor?.Dispose();

@@ -63,6 +63,9 @@ struct RunConfig {
   // Numerical id of the default speaker (multi-speaker voices)
   optional<piper::SpeakerId> speakerId;
 
+  // Path to speaker embedding binary file (192 float32 values) for zero-shot TTS
+  optional<filesystem::path> speakerEmbeddingPath;
+
   // Language code or numerical id (multi-language voices)
   optional<string> language;
 
@@ -137,6 +140,59 @@ void rawOutputProc(vector<int16_t> &sharedAudioBuffer, mutex &mutAudio,
 void processLine(string line, RunConfig &runConfig, piper::PiperConfig &piperConfig,
                  piper::Voice &voice, piper::SynthesisResult &result,
                  bool jsonInput, std::unique_ptr<piper::CustomDictionary> &customDict);
+
+// Load speaker embedding from a raw binary file (192 float32 = 768 bytes)
+// or a NumPy .npy file (header + 192 float32).
+std::vector<float> loadSpeakerEmbedding(const filesystem::path &path) {
+  const int64_t expectedDim = 192;
+
+  ifstream file(path, ios::binary | ios::ate);
+  if (!file.good()) {
+    throw runtime_error("Cannot open speaker embedding file: " + path.string());
+  }
+
+  auto fileSize = file.tellg();
+  file.seekg(0, ios::beg);
+
+  // Detect NumPy .npy format: starts with magic "\x93NUMPY"
+  char magic[6] = {};
+  file.read(magic, 6);
+  file.seekg(0, ios::beg);
+
+  std::vector<float> embedding;
+
+  if (magic[0] == '\x93' && magic[1] == 'N' && magic[2] == 'U' &&
+      magic[3] == 'M' && magic[4] == 'P' && magic[5] == 'Y') {
+    // NumPy .npy v1.0/v2.0 format
+    file.seekg(8, ios::beg); // skip magic(6) + major(1) + minor(1)
+    uint16_t headerLen = 0;
+    file.read(reinterpret_cast<char *>(&headerLen), sizeof(headerLen));
+    // Skip the header dict string
+    file.seekg(6 + 2 + 2 + headerLen, ios::beg);
+
+    auto dataStart = file.tellg();
+    auto dataBytes = fileSize - dataStart;
+    auto numFloats = static_cast<int64_t>(dataBytes) / sizeof(float);
+
+    embedding.resize(numFloats);
+    file.read(reinterpret_cast<char *>(embedding.data()),
+              numFloats * sizeof(float));
+  } else {
+    // Raw binary: expect exactly 192 * 4 = 768 bytes
+    auto numFloats = static_cast<int64_t>(fileSize) / sizeof(float);
+    embedding.resize(numFloats);
+    file.read(reinterpret_cast<char *>(embedding.data()),
+              numFloats * sizeof(float));
+  }
+
+  if (static_cast<int64_t>(embedding.size()) != expectedDim) {
+    spdlog::warn("Speaker embedding has {} values, expected {}; padding/truncating",
+                 embedding.size(), expectedDim);
+    embedding.resize(expectedDim, 0.0f);
+  }
+
+  return embedding;
+}
 
 // ----------------------------------------------------------------------------
 
@@ -284,6 +340,20 @@ int main(int argc, char *argv[]) {
   auto endTime = chrono::steady_clock::now();
   spdlog::info("Loaded voice in {} second(s)",
                chrono::duration<double>(endTime - startTime).count());
+
+  // Load speaker embedding from file
+  if (runConfig.speakerEmbeddingPath) {
+    try {
+      voice.synthesisConfig.speakerEmbedding =
+          loadSpeakerEmbedding(runConfig.speakerEmbeddingPath.value());
+      spdlog::info("Loaded speaker embedding from {} ({} values)",
+                   runConfig.speakerEmbeddingPath.value().string(),
+                   voice.synthesisConfig.speakerEmbedding->size());
+    } catch (const std::exception &e) {
+      spdlog::error("Failed to load speaker embedding: {}", e.what());
+      return EXIT_FAILURE;
+    }
+  }
 
   // Resolve --language to a numeric language ID
   if (runConfig.language) {
@@ -445,6 +515,7 @@ void processLine(string line, RunConfig &runConfig, piper::PiperConfig &piperCon
   auto outputType = runConfig.outputType;
   auto speakerId = voice.synthesisConfig.speakerId;
   auto languageId = voice.synthesisConfig.languageId;
+  auto speakerEmbedding = voice.synthesisConfig.speakerEmbedding;
   std::optional<filesystem::path> maybeOutputPath = runConfig.outputPath;
 
   // External prosody features (from JSON input)
@@ -500,6 +571,15 @@ void processLine(string line, RunConfig &runConfig, piper::PiperConfig &piperCon
         spdlog::warn("Unknown language code in JSON: '{}', using default (0)", langCode);
         voice.synthesisConfig.languageId = 0;
       }
+    }
+
+    if (lineRoot.contains("speaker_embedding")) {
+      // Override speaker embedding from JSON array of 192 floats
+      std::vector<float> emb;
+      for (const auto &val : lineRoot["speaker_embedding"]) {
+        emb.push_back(val.get<float>());
+      }
+      voice.synthesisConfig.speakerEmbedding = std::move(emb);
     }
 
     if (lineRoot.contains("prosody_features")) {
@@ -690,6 +770,7 @@ void processLine(string line, RunConfig &runConfig, piper::PiperConfig &piperCon
   // Restore config (--json-input)
   voice.synthesisConfig.speakerId = speakerId;
   voice.synthesisConfig.languageId = languageId;
+  voice.synthesisConfig.speakerEmbedding = speakerEmbedding;
 
 } // processLine
 
@@ -716,6 +797,9 @@ void printUsage(char *argv[]) {
           "becomes available"
        << endl;
   cerr << "   -s  NUM   --speaker     NUM   id of speaker (default: 0)" << endl;
+  cerr << "   --speaker-embedding     FILE  path to speaker embedding file "
+          "(192 float32 values, raw binary or .npy)"
+       << endl;
   cerr << "   -l  CODE  --language    CODE  language code or id (default: auto)" << endl;
   cerr << "   --noise_scale           NUM   generator noise (default: 0.667)"
        << endl;
@@ -837,6 +921,9 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     } else if (arg == "-s" || arg == "--speaker") {
       ensureArg(argc, argv, i);
       runConfig.speakerId = (piper::SpeakerId)stol(argv[++i]);
+    } else if (arg == "--speaker-embedding" || arg == "--speaker_embedding") {
+      ensureArg(argc, argv, i);
+      runConfig.speakerEmbeddingPath = filesystem::path(argv[++i]);
     } else if (arg == "-l" || arg == "--language") {
       ensureArg(argc, argv, i);
       runConfig.language = argv[++i];
@@ -944,6 +1031,7 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         "--output-timing", "--output_timing",
         "--timing-format", "--timing_format",
         "--custom-dict", "--custom_dict", "--text",
+        "--speaker-embedding", "--speaker_embedding",
         "--list-models", "--download-model", "--model-dir", "--model_dir",
         "--version", "--test-mode", "--debug", "--quiet", "--help",
         "--no-stochastic",

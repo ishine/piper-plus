@@ -49,6 +49,13 @@ internal sealed class JsonlUtterance
     /// </summary>
     [JsonPropertyName("speaker")]
     public string? Speaker { get; set; }
+
+    /// <summary>
+    /// 192-dimensional speaker embedding for zero-shot TTS.
+    /// When present, takes priority over <see cref="SpeakerId"/>.
+    /// </summary>
+    [JsonPropertyName("speaker_embedding")]
+    public float[]? SpeakerEmbedding { get; set; }
 }
 
 /// <summary>
@@ -108,6 +115,10 @@ internal static class Program
             Description = "Speaker ID (default: 0)",
             DefaultValueFactory = _ => 0,
         };
+
+        // --speaker-embedding
+        var speakerEmbeddingOption = new Option<FileInfo?>("--speaker-embedding")
+        { Description = "Path to speaker embedding file (192 float32 values, raw binary or .npy) for zero-shot TTS" };
 
         // --noise_scale / --noise-scale
         var noiseScaleOption = new Option<float>("--noise_scale", "--noise-scale")
@@ -241,6 +252,7 @@ internal static class Program
             outputDirOption,
             outputRawOption,
             speakerOption,
+            speakerEmbeddingOption,
             noiseScaleOption,
             lengthScaleOption,
             noiseWOption,
@@ -511,6 +523,13 @@ internal static class Program
                 float lengthScale = parseResult.GetValue(lengthScaleOption);
                 float noiseW = parseResult.GetValue(noiseWOption);
                 int speaker = parseResult.GetValue(speakerOption);
+                var speakerEmbeddingFile = parseResult.GetValue(speakerEmbeddingOption);
+                float[]? speakerEmbedding = null;
+                if (speakerEmbeddingFile is not null)
+                {
+                    speakerEmbedding = LoadSpeakerEmbedding(speakerEmbeddingFile.FullName);
+                    LogInfo(quiet, $"Loaded speaker embedding from {speakerEmbeddingFile.FullName} ({speakerEmbedding.Length} values)");
+                }
                 float sentenceSilence = parseResult.GetValue(sentenceSilenceOption);
                 bool outputRaw = parseResult.GetValue(outputRawOption);
                 bool jsonInput = parseResult.GetValue(jsonInputOption);
@@ -896,7 +915,8 @@ internal static class Program
                         audio = SynthesizeWithPhonemeSilence(
                             piperSession, phonemeIdsLong, prosodyFlat,
                             speaker, languageId, noiseScale, lengthScale, noiseW,
-                            phonemeSilenceMap, config.PhonemeIdMap, sampleRate);
+                            phonemeSilenceMap, config.PhonemeIdMap, sampleRate,
+                            speakerEmbedding);
                     }
                     catch (Exception ex)
                     {
@@ -954,7 +974,8 @@ internal static class Program
                                     chunkAudio = SynthesizeWithPhonemeSilence(
                                         piperSession, sentencePhonemeIds, sentenceProsody,
                                         speaker, languageId, noiseScale, lengthScale, noiseW,
-                                        phonemeSilenceMap, config.PhonemeIdMap, sampleRate);
+                                        phonemeSilenceMap, config.PhonemeIdMap, sampleRate,
+                                        speakerEmbedding);
                                 }
                                 catch (Exception ex)
                                 {
@@ -1029,7 +1050,8 @@ internal static class Program
                                 audio = SynthesizeWithPhonemeSilence(
                                     piperSession, phonemeIdsLong, null,
                                     speaker, languageId, noiseScale, lengthScale, noiseW,
-                                    phonemeSilenceMap, config.PhonemeIdMap, sampleRate);
+                                    phonemeSilenceMap, config.PhonemeIdMap, sampleRate,
+                                    speakerEmbedding);
                             }
                             catch (Exception ex)
                             {
@@ -1140,6 +1162,9 @@ internal static class Program
                             // Resolve language_id from JSONL (overrides CLI default)
                             int uttLanguageId = utterance?.LanguageId ?? languageId;
 
+                            // Resolve speaker_embedding: JSONL > CLI default
+                            float[]? uttSpeakerEmbedding = utterance?.SpeakerEmbedding ?? speakerEmbedding;
+
                             // ---------------------------------------------------
                             // JSONL "text" field: phonemize inline
                             // ---------------------------------------------------
@@ -1226,7 +1251,8 @@ internal static class Program
                                 audio = SynthesizeWithPhonemeSilence(
                                     piperSession, phonemeIdsLong, prosodyFlat,
                                     uttSpeaker, uttLanguageId, noiseScale, lengthScale, noiseW,
-                                    phonemeSilenceMap, config.PhonemeIdMap, sampleRate);
+                                    phonemeSilenceMap, config.PhonemeIdMap, sampleRate,
+                                    uttSpeakerEmbedding);
                             }
                             catch (Exception ex)
                             {
@@ -1295,7 +1321,8 @@ internal static class Program
         float noiseW,
         Dictionary<string, float>? phonemeSilenceMap,
         Dictionary<string, int[]> phonemeIdMap,
-        int sampleRate)
+        int sampleRate,
+        float[]? speakerEmbedding = null)
     {
         // Normal (non-split) path
         if (phonemeSilenceMap is null || phonemeSilenceMap.Count == 0)
@@ -1307,7 +1334,8 @@ internal static class Program
                 ProsodyFeatures: prosodyFlat,
                 NoiseScale: noiseScale,
                 LengthScale: lengthScale,
-                NoiseW: noiseW);
+                NoiseW: noiseW,
+                SpeakerEmbedding: speakerEmbedding);
             return piperSession.Synthesize(input);
         }
 
@@ -1334,7 +1362,8 @@ internal static class Program
                 ProsodyFeatures: phraseProsody,
                 NoiseScale: noiseScale,
                 LengthScale: lengthScale,
-                NoiseW: noiseW);
+                NoiseW: noiseW,
+                SpeakerEmbedding: speakerEmbedding);
 
             short[] phraseAudio = piperSession.Synthesize(input);
             segments.Add((phraseAudio, phrase.SilenceSamples));
@@ -1662,6 +1691,52 @@ internal static class Program
         {
             Console.Error.WriteLine($"[DBG] {message}");
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Speaker embedding I/O
+    // ----------------------------------------------------------------
+
+    /// <summary>
+    /// Load a speaker embedding from a raw binary file (192 float32 = 768 bytes)
+    /// or a NumPy .npy file (header + 192 float32).
+    /// </summary>
+    private static float[] LoadSpeakerEmbedding(string path)
+    {
+        const int expectedDim = 192;
+        byte[] bytes = File.ReadAllBytes(path);
+
+        float[] embedding;
+
+        // Detect NumPy .npy magic: \x93NUMPY
+        if (bytes.Length >= 10
+            && bytes[0] == 0x93 && bytes[1] == (byte)'N'
+            && bytes[2] == (byte)'U' && bytes[3] == (byte)'M'
+            && bytes[4] == (byte)'P' && bytes[5] == (byte)'Y')
+        {
+            // v1.0: header_len is uint16 at offset 8
+            int headerLen = BitConverter.ToUInt16(bytes, 8);
+            int dataOffset = 6 + 2 + 2 + headerLen; // magic + ver + headerLen + header
+            int numFloats = (bytes.Length - dataOffset) / sizeof(float);
+            embedding = new float[numFloats];
+            Buffer.BlockCopy(bytes, dataOffset, embedding, 0, numFloats * sizeof(float));
+        }
+        else
+        {
+            // Raw binary: expect 192 * 4 = 768 bytes
+            int numFloats = bytes.Length / sizeof(float);
+            embedding = new float[numFloats];
+            Buffer.BlockCopy(bytes, 0, embedding, 0, numFloats * sizeof(float));
+        }
+
+        if (embedding.Length != expectedDim)
+        {
+            var padded = new float[expectedDim];
+            Array.Copy(embedding, padded, Math.Min(embedding.Length, expectedDim));
+            return padded;
+        }
+
+        return embedding;
     }
 }
 

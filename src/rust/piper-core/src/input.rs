@@ -14,6 +14,9 @@ pub struct JsonlUtterance {
     pub speaker_id: Option<i64>,
 
     #[serde(default)]
+    pub speaker_embedding: Option<Vec<f32>>,
+
+    #[serde(default)]
     pub language_id: Option<i64>,
 
     #[serde(default)]
@@ -53,6 +56,7 @@ impl JsonlUtterance {
             phoneme_ids: self.phoneme_ids,
             prosody_features,
             speaker_id: self.speaker_id,
+            speaker_embedding: self.speaker_embedding,
             language_id: self.language_id,
             noise_scale,
             length_scale,

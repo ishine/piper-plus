@@ -41,6 +41,7 @@ public sealed class PiperModel : IDisposable
 
         // Detect optional capabilities from tensor names.
         HasSpeakerId = _session.InputMetadata.ContainsKey("sid");
+        HasSpeakerEmbedding = _session.InputMetadata.ContainsKey("speaker_embedding");
         HasLanguageId = _session.InputMetadata.ContainsKey("lid");
         HasProsody = _session.InputMetadata.ContainsKey("prosody_features");
 
@@ -59,6 +60,14 @@ public sealed class PiperModel : IDisposable
     /// indicating a multi-speaker model.
     /// </summary>
     public bool HasSpeakerId { get; }
+
+    /// <summary>
+    /// <c>true</c> when the model accepts a <c>speaker_embedding</c> tensor
+    /// (<c>[1, 192]</c> float32), indicating a zero-shot speaker conditioning model.
+    /// When both <c>sid</c> and <c>speaker_embedding</c> inputs are present,
+    /// <c>speaker_embedding</c> takes priority.
+    /// </summary>
+    public bool HasSpeakerEmbedding { get; }
 
     /// <summary>
     /// <c>true</c> when the model accepts a <c>lid</c> (language-id) tensor,

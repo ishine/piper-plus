@@ -33,6 +33,10 @@ struct Cli {
     #[arg(short, long)]
     speaker: Option<i64>,
 
+    /// Speaker embedding ファイル (192 float32, raw binary or .npy) for zero-shot TTS
+    #[arg(long = "speaker-embedding")]
+    speaker_embedding: Option<PathBuf>,
+
     /// 生成ノイズスケール
     #[arg(long, default_value_t = 0.667)]
     noise_scale: f32,
@@ -314,6 +318,19 @@ fn main() -> Result<()> {
         tracing::info!("Sentence silence: {:.3}s", cli.sentence_silence);
     }
 
+    // Load speaker embedding from file (shared across all modes)
+    let speaker_embedding: Option<Vec<f32>> = if let Some(ref emb_path) = cli.speaker_embedding {
+        let emb = load_speaker_embedding(emb_path)?;
+        tracing::info!(
+            "Loaded speaker embedding from {} ({} values)",
+            emb_path.display(),
+            emb.len()
+        );
+        Some(emb)
+    } else {
+        None
+    };
+
     if let Some(ref batch_path) = cli.batch {
         // --batch モード: テキストファイルから1行ずつ読み込み合成
         let mut voice = PiperVoice::load(&model_path, config_arg.as_deref(), &cli.device)
@@ -373,6 +390,7 @@ fn main() -> Result<()> {
                 .synthesize_text(
                     &text_to_synth,
                     cli.speaker,
+                    speaker_embedding.clone(),
                     cli.language.as_deref(),
                     cli.noise_scale,
                     cli.length_scale,
@@ -487,6 +505,7 @@ fn main() -> Result<()> {
                     .synthesize_text(
                         &text_to_synth,
                         cli.speaker,
+                        speaker_embedding.clone(),
                         cli.language.as_deref(),
                         cli.noise_scale,
                         cli.length_scale,
@@ -543,6 +562,7 @@ fn main() -> Result<()> {
                 .synthesize_text(
                     &text_to_synth,
                     cli.speaker,
+                    speaker_embedding.clone(),
                     cli.language.as_deref(),
                     cli.noise_scale,
                     cli.length_scale,
@@ -639,9 +659,14 @@ fn main() -> Result<()> {
             // SynthesisRequest 構築 (move semantics — clone を回避)
             let mut request = utterance.to_request(cli.noise_scale, cli.length_scale, cli.noise_w);
 
-            // CLI の speaker_id でオーバーライド
+            // CLI の speaker_id / speaker_embedding でオーバーライド
             if let Some(sid) = cli.speaker {
                 request.speaker_id = Some(sid);
+            }
+            if request.speaker_embedding.is_none() {
+                if let Some(ref emb) = speaker_embedding {
+                    request.speaker_embedding = Some(emb.clone());
+                }
             }
 
             // 推論実行
@@ -688,4 +713,64 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Load speaker embedding from a raw binary file (192 float32 = 768 bytes)
+/// or a NumPy .npy file (header + 192 float32).
+fn load_speaker_embedding(path: &std::path::Path) -> Result<Vec<f32>> {
+    const EXPECTED_DIM: usize = 192;
+
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Cannot open speaker embedding: {}", path.display()))?;
+
+    let embedding: Vec<f32> = if bytes.len() >= 6
+        && bytes[0] == 0x93
+        && bytes[1..6] == *b"NUMPY"
+    {
+        // NumPy .npy v1.0 format
+        let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        let data_offset = 6 + 2 + 2 + header_len;
+        let num_floats = (bytes.len() - data_offset) / 4;
+        let mut emb = Vec::with_capacity(num_floats);
+        for i in 0..num_floats {
+            let offset = data_offset + i * 4;
+            let val = f32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]);
+            emb.push(val);
+        }
+        emb
+    } else {
+        // Raw binary
+        let num_floats = bytes.len() / 4;
+        let mut emb = Vec::with_capacity(num_floats);
+        for i in 0..num_floats {
+            let offset = i * 4;
+            let val = f32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]);
+            emb.push(val);
+        }
+        emb
+    };
+
+    if embedding.len() != EXPECTED_DIM {
+        tracing::warn!(
+            "Speaker embedding has {} values, expected {}; padding/truncating",
+            embedding.len(),
+            EXPECTED_DIM
+        );
+        let mut padded = vec![0.0f32; EXPECTED_DIM];
+        let copy_len = embedding.len().min(EXPECTED_DIM);
+        padded[..copy_len].copy_from_slice(&embedding[..copy_len]);
+        return Ok(padded);
+    }
+
+    Ok(embedding)
 }
