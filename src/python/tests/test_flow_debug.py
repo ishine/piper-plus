@@ -7,11 +7,12 @@ Loads the epoch=199 checkpoint, runs flow.reverse, and checks:
   - NaN/Inf presence at each layer
   - Final z and audio output quality
 """
-import sys
+
 from pathlib import Path
 
 import numpy as np
 import pytest
+
 
 try:
     import torch
@@ -92,7 +93,7 @@ def loaded_model():
     model_state = {}
     for k, v in state_dict.items():
         if k.startswith("model_g."):
-            model_state[k[len("model_g."):]] = v
+            model_state[k[len("model_g.") :]] = v
 
     # Remap weight_norm keys (DDP parametrized ↔ legacy format)
     model_state = remap_weight_norm_keys(model_state, model.state_dict())
@@ -129,7 +130,9 @@ class TestFlowReverseNumerics:
         """Verify checkpoint loads without key mismatches."""
         model, hp, missing, unexpected, incompatible_keys = loaded_model
         print(f"\nCheckpoint: {CKPT_PATH}")
-        print(f"gin_channels={hp.get('gin_channels')}, inter_channels={hp.get('inter_channels')}")
+        print(
+            f"gin_channels={hp.get('gin_channels')}, inter_channels={hp.get('inter_channels')}"
+        )
         print(f"Missing keys: {len(missing)}")
         for k in missing[:5]:
             print(f"  {k}")
@@ -137,7 +140,9 @@ class TestFlowReverseNumerics:
         for k in unexpected[:5]:
             print(f"  {k}")
         if incompatible_keys:
-            print(f"Incompatible keys (skipped due to mean_only change): {len(incompatible_keys)}")
+            print(
+                f"Incompatible keys (skipped due to mean_only change): {len(incompatible_keys)}"
+            )
             for k in incompatible_keys:
                 print(f"  {k}")
         # Allow missing keys for:
@@ -147,26 +152,32 @@ class TestFlowReverseNumerics:
         # - dec.cond_layers: Decoder FiLM conditioning (new in Phase 2)
         # - dec.ups.*.weight_g/weight_v: weight_norm decomposition (new parametrization)
         allowed_prefixes = (
-            "spk_proj_teacher", "dino_center", "flow.",
-            "enc_p.cond_layer", "dec.cond_layers", "dec.ups.",
+            "spk_proj_teacher",
+            "dino_center",
+            "flow.",
+            "enc_p.cond_layer",
+            "dec.cond_layers",
+            "dec.ups.",
         )
         allowed_missing = [
-            k for k in missing
+            k
+            for k in missing
             if not any(k.startswith(prefix) for prefix in allowed_prefixes)
         ]
-        assert len(allowed_missing) == 0, \
-            f"Unexpected missing keys: {allowed_missing}"
+        assert len(allowed_missing) == 0, f"Unexpected missing keys: {allowed_missing}"
 
     def test_flow_architecture(self, loaded_model):
         """Print flow architecture and verify mean_only=True."""
         model, hp, _, _, _ = loaded_model
         flow = model.flow
-        print(f"\nFlow: n_flows={flow.n_flows}, channels={flow.channels}, "
-              f"hidden={flow.hidden_channels}, dilation_rate={flow.dilation_rate}")
+        print(
+            f"\nFlow: n_flows={flow.n_flows}, channels={flow.channels}, "
+            f"hidden={flow.hidden_channels}, dilation_rate={flow.dilation_rate}"
+        )
         coupling_count = 0
         for i, f_layer in enumerate(flow.flows):
             ltype = type(f_layer).__name__
-            if hasattr(f_layer, 'mean_only'):
+            if hasattr(f_layer, "mean_only"):
                 print(f"  flows[{i}]: {ltype}  mean_only={f_layer.mean_only}")
                 assert f_layer.mean_only, f"flow[{i}] should have mean_only=True"
                 coupling_count += 1
@@ -188,7 +199,7 @@ class TestFlowReverseNumerics:
         flow = model.flow
         print("\nResidualCouplingLayer post weights (mean_only=True):")
         for i, f_layer in enumerate(flow.flows):
-            if not hasattr(f_layer, 'post'):
+            if not hasattr(f_layer, "post"):
                 continue
             w = f_layer.post.weight.data
             b = f_layer.post.bias.data
@@ -198,8 +209,9 @@ class TestFlowReverseNumerics:
 
             # With mean_only=True, post outputs half_channels
             half_channels = f_layer.half_channels
-            assert w.shape[0] == half_channels, \
+            assert w.shape[0] == half_channels, (
                 f"flow[{i}] post weight shape[0] should be {half_channels} (mean_only=True), got {w.shape[0]}"
+            )
 
     def test_per_layer_reverse_statistics(self, loaded_model):
         """Run flow.reverse layer by layer and inspect statistics."""
@@ -215,9 +227,9 @@ class TestFlowReverseNumerics:
         with torch.no_grad():
             g = model.spk_proj(spk_emb).unsqueeze(-1)
 
-        print(f"\nInput z_p:")
+        print("\nInput z_p:")
         _print_stats(_stats(z_p, "z_p"))
-        print(f"Speaker g:")
+        print("Speaker g:")
         _print_stats(_stats(g, "g"))
 
         x = z_p
@@ -273,10 +285,12 @@ class TestFlowReverseNumerics:
                     all_ok = False
 
         z_final = x
-        print(f"\nFinal z (after flow.reverse):")
+        print("\nFinal z (after flow.reverse):")
         _print_stats(_stats(z_final, "z_final"))
 
-        assert all_ok, "NaN/Inf or dangerous exp(-logs) values detected during flow.reverse"
+        assert all_ok, (
+            "NaN/Inf or dangerous exp(-logs) values detected during flow.reverse"
+        )
 
     def test_flow_reverse_consistency(self, loaded_model):
         """Compare manual per-layer output vs model.flow() reverse."""
@@ -305,8 +319,9 @@ class TestFlowReverseNumerics:
 
         diff = (z_manual - z_actual).abs()
         _print_stats(_stats(diff, "diff (manual vs model.flow)"))
-        assert diff.max().item() < 1e-4, \
+        assert diff.max().item() < 1e-4, (
             f"Manual vs model.flow reverse mismatch: max diff = {diff.max().item()}"
+        )
 
     def test_mean_distribution_per_layer(self, loaded_model):
         """Analyze mean output distribution per coupling layer (mean_only=True)."""
@@ -324,7 +339,7 @@ class TestFlowReverseNumerics:
 
         print("\nMean output distribution per coupling layer (mean_only=True):")
         for i, f_layer in enumerate(flow.flows):
-            if not hasattr(f_layer, 'post'):
+            if not hasattr(f_layer, "post"):
                 continue
 
             with torch.no_grad():
@@ -338,7 +353,7 @@ class TestFlowReverseNumerics:
             pvals = np.percentile(m_flat, percentiles)
 
             print(f"\n  flow[{i}] mean distribution:")
-            for p, v in zip(percentiles, pvals):
+            for p, v in zip(percentiles, pvals, strict=False):
                 print(f"    P{p:3d}: {v:+8.4f}")
 
             _print_stats(_stats(m, f"flow[{i}] mean output"))
@@ -386,7 +401,9 @@ class TestFlowReverseNumerics:
             print(f"  Peak frequency: ~{peak_freq:.0f} Hz (bin {peak_freq_bin})")
             print(f"  Peak energy ratio: {fft_energy_ratio:.4f}")
             if fft_energy_ratio > 0.5:
-                print("  *** WARNING: Single frequency dominates - likely beep/tone ***")
+                print(
+                    "  *** WARNING: Single frequency dominates - likely beep/tone ***"
+                )
 
         # NaN/Inf checks
         assert not torch.isnan(audio).any(), "Audio contains NaN"
@@ -409,7 +426,7 @@ class TestFlowReverseNumerics:
     def test_spk_proj_output_range(self, loaded_model):
         """Check that spk_proj output range is reasonable for conditioning."""
         model, hp, _, _, _ = loaded_model
-        if not hasattr(model, 'spk_proj'):
+        if not hasattr(model, "spk_proj"):
             pytest.skip("No spk_proj in model")
 
         # Test with multiple speaker embeddings
@@ -444,7 +461,9 @@ class TestFlowReverseNumerics:
         # Check logs_p range
         assert not torch.isnan(m_p).any(), "m_p contains NaN"
         assert not torch.isnan(logs_p).any(), "logs_p contains NaN"
-        print(f"  exp(logs_p) range: [{torch.exp(logs_p).min().item():.4f}, {torch.exp(logs_p).max().item():.4f}]")
+        print(
+            f"  exp(logs_p) range: [{torch.exp(logs_p).min().item():.4f}, {torch.exp(logs_p).max().item():.4f}]"
+        )
 
     def test_multiple_speakers_flow_stability(self, loaded_model):
         """Test flow reverse with multiple different speaker embeddings."""
@@ -468,6 +487,10 @@ class TestFlowReverseNumerics:
             assert s["nan_count"] == 0, f"NaN in flow reverse for seed={seed}"
             assert s["inf_count"] == 0, f"Inf in flow reverse for seed={seed}"
             if abs(s["std"]) < 0.01:
-                print(f"  *** WARNING: Very low std for seed={seed} - possible collapse ***")
+                print(
+                    f"  *** WARNING: Very low std for seed={seed} - possible collapse ***"
+                )
             if abs(s["max"]) > 100:
-                print(f"  *** WARNING: Large max for seed={seed} - possible explosion ***")
+                print(
+                    f"  *** WARNING: Large max for seed={seed} - possible explosion ***"
+                )

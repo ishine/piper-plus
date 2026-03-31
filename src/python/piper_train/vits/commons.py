@@ -42,15 +42,11 @@ def remap_weight_norm_keys(saved_sd: dict, model_sd: dict) -> dict:
 
         # New → Old
         elif ".parametrizations.weight.original0" in key:
-            candidate = key.replace(
-                ".parametrizations.weight.original0", ".weight_g"
-            )
+            candidate = key.replace(".parametrizations.weight.original0", ".weight_g")
             if candidate in model_sd and key not in model_sd:
                 new_key = candidate
         elif ".parametrizations.weight.original1" in key:
-            candidate = key.replace(
-                ".parametrizations.weight.original1", ".weight_v"
-            )
+            candidate = key.replace(".parametrizations.weight.original1", ".weight_v")
             if candidate in model_sd and key not in model_sd:
                 new_key = candidate
 
