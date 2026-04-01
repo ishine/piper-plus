@@ -61,6 +61,10 @@ jobs:
         uv pip install --system cython
         python piper_train/vits/monotonic_align/setup.py build_ext --inplace
 
+    - name: Download NLTK data (for g2p-en English phonemizer)
+      run: |
+        python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng', quiet=True); nltk.download('cmudict', quiet=True)"
+
     - name: Run unit tests (Windows)
       if: runner.os == 'Windows'
       run: |
