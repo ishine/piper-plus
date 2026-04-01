@@ -4,398 +4,491 @@ Piper TTSは高品質なニューラルテキスト音声合成システムで�
 
 ---
 
-## 🚀 現在の状態: 6言語マルチリンガル対応 (コード: 8言語対応、sv/ko含む)
+## 🔴 現在の状態: Zero-Shot TTS v5 再学習待ち
 
-> **Note:** G2Pコードは8言語 (JA/EN/ZH/KO/ES/FR/PT/SV) に対応済み。学習済みモデルは6言語 (SV/KO未学習)。
+**ブランチ**: `feat/zero-shot-tts`（Phase 2改善実装済み + C++/C#/Rust zero-shot推論対応）
 
-**ブランチ**: `dev`
-
-### 最新データセット: `dataset-multilingual-6lang-filtered` (6言語マルチリンガル)
+### 概要 (2026-04-01 更新)
 
 | 項目 | 値 |
 |------|-----|
-| データセット | `dataset-multilingual-6lang-filtered` |
-| 発話数 | **508,187** |
-| 話者数 | 571 |
-| シンボル数 | 173 |
-| 言語数 | 6 (ja=0, en=1, zh=2, es=3, fr=4, pt=5) |
-| 最小発話数/話者 | 31 (>=30 でフィルタ済み) |
-| 状態 | **学習完了 (2026-03-16)** -- 75 epoch、epoch=74-step=504712.ckpt |
+| データセット | `dataset-zero-shot-20speakers`（per-utterance speaker embedding付き） |
+| 話者数 | 20 |
+| Speaker Encoder | CAM++ (192次元, ONNX, Apache-2.0) |
+| アーキテクチャ | **spk_proj専用** (emb_g廃止、2-layer MLP) |
+| gin_channels | 512 |
+| SCL | **CAM++ ONNX** (c_spk=1.0) + mel-domain L1フォールバック |
+| DINO | 自己蒸留（EMA teacher、momentum=0.996、c_dino=0.5） |
+| KLアニーリング | 0.1→1.0 線形増加（10エポック） |
+| LRスケジュール | **Cosine Annealing** (`--lr-scheduler cosine --lr-warmup-epochs 5 --lr-min 1e-5`) |
+| torch.compile | off（デフォルト、`--compile` で有効化可能） |
+| Decoder | **Multi-scale FiLM** (sigmoid+0.5, 各アップサンプル段) |
+| Flow | dilation_rate=2（指数的受容野拡大） |
+| D:G比率 | **1:1** (デフォルト) |
+| Embedding摂動 | **σ=0.05** (汎化性能向上) |
+| max_epochs | **100** (過学習防止、200推奨) |
+| EMA | decoder + spk_proj 両方を追跡 |
+| 推論デフォルト | noise_scale=0.4, noise_scale_w=0.5 |
+| ネイティブCLI | C++/C#/Rust全て `--speaker-embedding` 対応 |
 
-**言語別内訳:**
-
-| 言語 | 話者数 | 発話数 | ソース |
-|------|--------|--------|--------|
-| ja | 20 | 60,148 | MOE-Speech (v4再利用) |
-| en | 310 | 74,912 | LibriTTS-R (v4再利用) |
-| zh | 142 | 63,223 | AISHELL-3 (Apache-2.0) |
-| es | 63 | 168,374 | CML-TTS Spanish (CC-BY-4.0) |
-| fr | 28 | 107,464 | CML-TTS French (CC-BY-4.0) |
-| pt | 8 | 34,066 | CML-TTS Portuguese (CC-BY-4.0) |
-
-**前処理ツール:** `src/python/piper_train/tools/prepare_multilingual_dataset.py`
-
-### 6言語事前学習コマンド (学習完了)
+### v5 再学習コマンド
 
 ```bash
-export WANDB_API_KEY=$(grep WANDB_API_KEY /data/piper/.env | cut -d= -f2) && \
-NCCL_DEBUG=WARN NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
-nohup /data/piper/.venv/bin/python -m piper_train \
-  --dataset-dir /data/piper/dataset-multilingual-6lang-filtered \
+WANDB_MODE=disabled NCCL_DEBUG=WARN NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+uv run python -m piper_train \
+  --dataset-dir /data/piper/dataset-zero-shot-20speakers \
   --prosody-dim 16 \
-  --accelerator gpu --devices 4 --precision 32-true \
-  --max_epochs 75 --batch-size 20 --samples-per-speaker 2 \
-  --checkpoint-epochs 5 --quality medium \
+  --accelerator gpu --devices 4 --precision 16-mixed \
+  --max_epochs 100 --batch-size 20 --samples-per-speaker 4 \
+  --checkpoint-epochs 2 --quality medium \
   --base_lr 2e-4 --disable_auto_lr_scaling \
-  --ema-decay 0.9995 \
-  --max-phoneme-ids 400 \
+  --ema-decay 0.9995 --num-workers 4 --no-pin-memory \
   --no-wavlm \
-  --audio-log-epochs 5 \
-  --default_root_dir /data/piper/output-multilingual-6lang \
-  > /data/piper/training_multilingual_6lang.log 2>&1 &
+  --spk-emb-noise-sigma 0.05 \
+  --d-update-interval 1 \
+  --lr-scheduler cosine --lr-warmup-epochs 5 --lr-min 1e-5 \
+  --c-spk 1.0 \
+  --speaker-encoder-path /data/piper/models/campplus.onnx \
+  --default_root_dir /data/piper/output-zero-shot-20speakers-v5
 ```
 
-**設計根拠:**
+**注意**: GPU構成に応じて `--devices`, `--batch-size`, `--num-workers` を調整
 
-| パラメータ | 値 | 根拠 |
-|-----------|-----|------|
-| `--max_epochs 75` | 75ep x 3,758 batches/gpu = ~282K gradient steps (v4の~270Kと同等) |
-| `--batch-size 20` | v4と同一。173 symbols でも V100 16GB に収まる |
-| `--samples-per-speaker 2` | 6言語 x スロット配分: ja=2, en=2, zh=2, es=2, fr=1, pt=1 |
-| `--checkpoint-epochs 5` | 75ep / 5 = 15 チェックポイント |
-| 実際の学習時間 | ~92時間 (~3.8日) -- 7回リスタート含む |
-| language-balanced-sampling | 自動有効化 (話者比 >= 3:1) |
+### v4からの変更点 (Phase 2改善)
 
----
+| # | 変更 | 根拠 |
+|---|------|------|
+| 1 | emb_g廃止→spk_proj専用 | emb_g/spk_proj不整合(cos=0.678)解消 |
+| 2 | Multi-scale FiLM (4段) | 1箇所FiLMの256倍希釈問題解消 |
+| 3 | sigmoid+0.5活性化 | tanh飽和(46.5%)問題解消 |
+| 4 | mel-domain SCL (微分可能) | CAM++ ONNX非微分問題解消 |
+| 5 | Cosine Annealing LR | ExponentialLR(2.5%減衰)→99.5%減衰 |
+| 6 | max_epochs 100 | 過学習防止 |
+| 7 | D:G=2:1 | Discriminator強化 |
+| 8 | σ=0.05 | 未知話者汎化向上 |
 
-## つくよみちゃん 6langベースファインチューニング (2026-03-16 完了)
-
-6言語マルチリンガルモデル (571話者, 75 epoch) をベースとして、つくよみちゃんデータ (100発話, ~11分) を転移学習。500 epoch完了。v1はfreeze_dpタイミングバグで失敗、v2で修正済み。
-
-**ワークフロー:**
-1. **学習時**: `--resume-from-multispeaker-checkpoint` で emb_lang[0:5] を元の embedding + emb_g_mean 補正のまま保持。`--freeze-dp` は自動有効化。
-2. **ONNXエクスポート時**: `export_onnx` が自動で `emb_lang[0]` → `emb_lang[1:5]` にコピーして声質を統一 (`--unify-emb-lang` がシングルスピーカー多言語モデルで自動有効化)。
-
-**データセット:** `/data/piper/dataset-tsukuyomi-finetune-6lang/` (100発話, 1話者, 173シンボル, 6言語)
-
-**学習コマンド:**
-```bash
-export WANDB_API_KEY=$(grep WANDB_API_KEY /data/piper/.env | cut -d= -f2) && \
-NCCL_DEBUG=WARN NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
-nohup /data/piper/.venv/bin/python -m piper_train \
-  --dataset-dir /data/piper/dataset-tsukuyomi-finetune-6lang \
-  --prosody-dim 16 \
-  --accelerator gpu --devices 1 --precision 32-true \
-  --max_epochs 500 --batch-size 4 --samples-per-speaker 4 \
-  --checkpoint-epochs 50 --quality medium \
-  --base_lr 2e-5 --disable_auto_lr_scaling \
-  --ema-decay 0.9995 \
-  --max-phoneme-ids 400 \
-  --no-wavlm \
-  --val-every-n-epochs 50 \
-  --audio-log-epochs 50 \
-  --resume-from-multispeaker-checkpoint \
-    /data/piper/output-multilingual-6lang/lightning_logs/version_0/checkpoints/epoch=74-step=504712.ckpt \
-  --default_root_dir /data/piper/output-tsukuyomi-finetune-6lang-v2 \
-  > /data/piper/training_tsukuyomi_6lang_v2.log 2>&1 &
-```
-
-**推論結果:**
-
-| テキスト | 言語 | 音声長 |
-|---------|------|--------|
-| 「こんにちは、つくよみちゃんです。」 | JA | 3.05s |
-| "Hello, how are you today?" | EN | 2.54s |
-| "你好，今天天气很好。" | ZH | 1.21s |
-| "¿Hola, cómo estás hoy?" | ES | 2.86s |
-| "Bonjour, comment allez-vous?" | FR | 2.11s |
-| "Olá, como você está hoje?" | PT | 2.24s |
-
-**注意:** ZH の duration (1.21s) が他言語 (2-3s) と比べて短い。凍結された DP の ZH パラメータ特性による。
-
-**生成モデル:** `/data/piper/output-tsukuyomi-finetune-6lang-v2/tsukuyomi-6lang-v2-fixed.onnx` (emb_lang後処理済み)
-**チェックポイント:** `output-tsukuyomi-finetune-6lang-v2/lightning_logs/version_0/checkpoints/epoch=499-step=22000.ckpt`
-
----
-
-## ファインチューニング テンプレート
-
-### Template A: 事前学習 (Multi-speaker pretraining)
+### CAM++ ONNXモデルのダウンロード
 
 ```bash
-export WANDB_API_KEY=$(grep WANDB_API_KEY /data/piper/.env | cut -d= -f2) && \
-NCCL_DEBUG=WARN NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
-nohup /data/piper/.venv/bin/python -m piper_train \
-  --dataset-dir <DATASET_DIR> \
-  --prosody-dim 16 \
-  --accelerator gpu --devices 4 --precision 32-true \
-  --max_epochs <EPOCHS> --batch-size 20 --samples-per-speaker 2 \
-  --checkpoint-epochs 5 --quality medium \
-  --base_lr 2e-4 --disable_auto_lr_scaling \
-  --ema-decay 0.9995 \
-  --max-phoneme-ids 400 \
-  --no-wavlm \
-  --audio-log-epochs 5 \
-  --default_root_dir <OUTPUT_DIR> \
-  > training.log 2>&1 &
+# HuggingFace CosyVoice-300M リポジトリから取得 (27MB, Apache-2.0)
+mkdir -p /home/shadeform/data/piper/models
+wget -q "https://huggingface.co/model-scope/CosyVoice-300M/resolve/main/campplus.onnx" \
+  -O /home/shadeform/data/piper/models/campplus.onnx
 ```
 
-### Template B: シングルスピーカー ファインチューニング
+**モデル仕様:**
+| 項目 | 値 |
+|------|-----|
+| 入力 | Fbank `[batch, T, 80]` (16kHz, 80-dim) |
+| 出力 | Speaker Embedding `[batch, 192]` (L2正規化済み) |
+| サイズ | 27MB |
+| ライセンス | Apache-2.0 |
+| 出典 | 3D-Speaker / ModelScope CAM++ |
+
+### Speaker Embedding前処理
 
 ```bash
-export WANDB_API_KEY=$(grep WANDB_API_KEY /data/piper/.env | cut -d= -f2) && \
-NCCL_DEBUG=WARN NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
-nohup /data/piper/.venv/bin/python -m piper_train \
-  --dataset-dir <FINETUNE_DATASET> \
-  --prosody-dim 16 \
-  --accelerator gpu --devices 1 --precision 32-true \
-  --max_epochs 500 --batch-size 4 --samples-per-speaker 4 \
-  --checkpoint-epochs 50 --quality medium \
-  --base_lr 2e-5 --disable_auto_lr_scaling \
-  --ema-decay 0.9995 \
-  --max-phoneme-ids 400 \
-  --no-wavlm \
-  --val-every-n-epochs 50 \
-  --audio-log-epochs 50 \
-  --resume-from-multispeaker-checkpoint <BASE_CHECKPOINT> \
-  --default_root_dir <OUTPUT_DIR> \
-  > training.log 2>&1 &
+# Step 1: Per-utterance embedding抽出（学習用・推奨）
+# 各発話の音声から個別にembeddingを生成し、dataset.jsonlを自動更新
+# DataLoaderで並列CPU前処理、推論は1発話ずつ実行（ゼロパディング回避）
+uv run python -m piper_train.extract_speaker_embedding \
+  --encoder /home/shadeform/data/piper/models/campplus.onnx \
+  --dataset-dir /home/shadeform/data/piper/dataset-moe-speech-20speakers \
+  --per-utterance --batch-size 64 --num-workers 12
+
+# Step 2: Per-speaker embedding抽出（推論用reference）
+# 話者ごとに複数発話の平均embeddingを生成
+uv run python -m piper_train.extract_speaker_embedding \
+  --encoder /home/shadeform/data/piper/models/campplus.onnx \
+  --dataset-dir /home/shadeform/data/piper/dataset-moe-speech-20speakers \
+  --output-dir /path/to/embeddings
 ```
 
-### パラメータ差分
+**Per-utterance vs Per-speaker:**
+- 学習にはper-utterance推奨（推論時の条件と一致、zero-shot精度向上）
+- per-utteranceは `dataset.jsonl` に `speaker_embedding_path` を自動追加
+- 出力: 各発話ごとに `speaker_embeddings/{hash}.npy` (192次元, 896バイト)
+- 個別ONNX推論で正確なembeddingを保証（ゼロパディングによるembedding破損を回避）
+- DataLoaderの `batch_size` はCPU前処理（fbank抽出）の並列度を制御
 
-| パラメータ | 事前学習 (A) | ファインチューニング (B) | 理由 |
-|-----------|-------------|----------------------|------|
-| `--devices` | 4 | 1 | 小データでDDPはオーバーヘッド過多 |
-| `--base_lr` | 2e-4 | 2e-5 | catastrophic forgetting防止 (1/10) |
-| `--batch-size` | 20 | 4 | 100発話 / 4 = 25 batches/epoch |
-| `--max_epochs` | データ量に応じて | 500 | 25x500=12,500 gradient steps |
-| `--freeze-dp` | なし | 自動有効化 | DP catastrophic forgetting防止 |
-| `--audio-log-epochs` | 5 | 50 | Validation頻度に合わせる |
+### 完了済みモデル
+
+```
+/home/shadeform/data/piper/output-moe-speech-20speakers-v2/
+├── lightning_logs/version_0/checkpoints/
+│   ├── epoch=199-step=206000.ckpt
+│   └── last.ckpt
+└── moe-speech-20speakers-v2.onnx  ← 本番用モデル (74MB)
+```
+
+### 推論テスト
+
+```bash
+CUDA_VISIBLE_DEVICES="" uv run python -m piper_train.infer_onnx \
+  --model /home/shadeform/data/piper/output-moe-speech-20speakers-v2/moe-speech-20speakers-v2.onnx \
+  --config /home/shadeform/data/piper/dataset-moe-speech-20speakers-v2/config.json \
+  --output-dir /path/to/output \
+  --text "こんにちは、今日は良い天気ですね。" \
+  --speaker-id 0
+```
+
+<details>
+<summary>WavLM学習情報（アーカイブ）</summary>
+
+WavLM Discriminator学習は150/200 epochで中断。音割れ（クリッピング）が発生していた。
+- WandB: https://wandb.ai/yousan/piper-tts/runs/0eftq9nt
+- チェックポイント: `/home/shadeform/data/piper/output-moe-speech-20speakers-wavlm/`
+
+</details>
 
 ---
 
 ## 実装済み機能
 
-### Duration Predictor 凍結 (--freeze-dp)
+### Zero-Shot Speaker Conditioning改善 Phase 2 ✅ NEW (2026-03-17)
+
+Zero-Shot TTS の話者再現精度・学習安定性・推論品質を大幅に向上させる10項目の改善。Phase 1（spk_proj MLP、SCL、DINO、L2正規化除去）をベースに、モデルアーキテクチャと学習手法の両面から強化。
+
+**1. Flow改善: mean_only=True + dilation_rate=2:**
+- `ResidualCouplingBlock` で `mean_only=True`（平均のみ学習）。`mean_only=False` はaffine couplingのscaleが崩壊（scale collapse）する問題が発生したため `mean_only=True` に戻した
+- `dilation_rate=2`: 指数的受容野の拡大（1,2,4,8,...）で長距離依存性をキャプチャ
+- dilation_rate=2 は旧VITS実装の `dilation_rate=1` から変更し維持
+
+**2. TextEncoder話者条件付け:**
+- `TextEncoder` に `gin_channels` 入力を追加、`self.cond = nn.Conv1d(gin_channels, hidden_channels, 1)`
+- encoder出力に話者条件 `g` を加算: `x = x + self.cond(g)`
+- prior分布 (m_p, logs_p) が話者依存に。zero-shot時のprior推定精度が向上
+
+**3. Decoder FiLM条件付け:**
+- 旧: additive conditioning (`x = x + self.cond(g)`)
+- 新: FiLM (Feature-wise Linear Modulation) `x = x * (1.0 + scale) + shift`
+- `self.cond = nn.Conv1d(gin_channels, upsample_initial_channel * 2, 1)` で scale/shift を同時生成
+- 話者特性がデコーダの各特徴量に対してスケール・シフト両方で作用
+
+**4. Duration Predictor乗算スケーリング:**
+- `StochasticDurationPredictor` / `DurationPredictor` に `cond_scale` を追加
+- `scale = torch.sigmoid(self.cond_scale(g)) + 0.5`、`x = x * scale + self.cond(g)`
+- 話者別の発話速度をモデリング（加算のみでは表現できない話者固有のテンポ差に対応）
+
+**5. KLアニーリング:**
+- `--kl-annealing-epochs 10`（デフォルト有効）
+- KL重みを 0.1 → 1.0 へ線形増加（`kl_weight = c_kl * (0.1 + 0.9 * epoch / kl_annealing_epochs)`）
+- 学習初期にdecoderがメル再構成に集中し、posterior collapse を回避
+
+**6. Speaker Embedding摂動:**
+- 学習時にspeaker embeddingへ `sigma=0.02` のGaussianノイズを追加
+- `speaker_embeddings = speaker_embeddings + torch.randn_like(speaker_embeddings) * 0.02`
+- 推論時の未知話者embeddingに対する汎化性能を向上
+
+**7. Validation実embedding:**
+- 旧: zero-shot validation時にゼロembedding (`torch.zeros(1, 192)`) を使用 → 意味のないaudio生成
+- 新: テスト発話の `speaker_embedding` が存在すれば実embeddingを使用、なければゼロにフォールバック
+- validation audioの品質が実際のzero-shot推論を反映
+
+**8. EMA spk_proj対応:**
+- `EMACallback` がデコーダEMAに加え `spk_proj` もEMA追跡
+- `ema_spk_proj`: validation時にshadow weightsを適用、学習時に元の重みを復元
+- checkpoint保存/復元にも `ema_spk_proj_state` を含む
+
+**9. 推論デフォルト最適化:**
+- `noise_scale=0.4`（旧: 0.667）、`noise_scale_w=0.5`（旧: 0.8）
+- zero-shot推論での話者類似度に最適化されたデフォルト値
+- `infer_onnx.py` のargparseデフォルトを更新
+
+**10. ロス重み調整:**
+- `c_spk=1.0`（デフォルト）: 非微分SCLの適切な重み
+- `c_dino=0.5`（デフォルト、旧: 0.1）: DINO自己蒸留の正則化効果を強化
+- `spk_emb_dropout=0.5`（デフォルト）: dual-mode学習でemb_gとspk_projの両方を活用
+
+**実装ファイル:**
+- `src/python/piper_train/vits/models.py` — Flow mean_only=True + dilation_rate=2、TextEncoder gin_channels条件付け、Decoder FiLM、DP cond_scale
+- `src/python/piper_train/vits/lightning.py` — KLアニーリング、speaker embedding摂動、validation実embedding
+- `src/python/piper_train/vits/ema.py` — EMA spk_proj対応
+- `src/python/piper_train/infer_onnx.py` — 推論デフォルト最適化
+- `src/python/piper_train/__main__.py` — --kl-annealing-epochs、c_spk/c_dino/spk_emb_dropoutデフォルト
+
+### Zero-Shot Speaker Conditioning 改善 Phase 1 ✅ (2026-03-17)
+
+Zero-Shot TTS の話者再現精度と学習安定性を向上させる4つの改善。
+
+**1. spk_proj を 2-layer MLP に変更:**
+- 旧: `nn.Linear(192, 512)` → 新: `Linear(192,512) -> LayerNorm -> GELU -> Linear(512,512)`
+- 非線形射影によりspeaker embedding空間の表現力が向上
+
+**2. SCL (Speaker Consistency Loss) の有効化:**
+- `--speaker-encoder-path` で CAM++ ONNX モデルを指定すると有効
+- 生成音声からspeaker embeddingを抽出し、参照embeddingとのコサイン類似度で損失計算
+- CAM++ は CPU ONNX で推論（CamPPSpeakerEncoder、非nn.Module）
+- `--c-spk` で重み調整（デフォルト1.0）
+
+**3. L2正規化の除去 (`_get_speaker_condition`):**
+- MLP (LayerNorm + GELU) がスケーリングを学習するため、L2正規化が不要に
+- embedding を `spk_proj` に通した結果をそのまま使用
+
+**4. Per-utterance embedding のゼロパディング修正:**
+- 旧: バッチ内で長さを揃えるためにゼロパディング → CAM++がゼロフレームを実データとして処理し embedding が破損
+- 新: DataLoader で並列 CPU 前処理（fbank 抽出）しつつ、ONNX推論は1発話ずつ実行
+- `_collate_fbanks` がリスト形式で返し、各発話を個別推論
+
+**DINO 自己蒸留:**
+- `spk_proj_teacher` (EMA teacher、momentum=0.996) で話者埋め込み空間を正則化
+- `dino_center` バッファで教師出力のセンタリング
+- `--c-dino` で重み調整（デフォルト0.5）
+
+**実装ファイル:**
+- `src/python/piper_train/vits/models.py` — spk_proj MLP定義、L2正規化除去
+- `src/python/piper_train/vits/lightning.py` — CamPPSpeakerEncoder、SCL・DINO統合
+- `src/python/piper_train/vits/losses.py` — speaker_consistency_loss、dino_loss
+- `src/python/piper_train/extract_speaker_embedding.py` — 個別ONNX推論、_collate_fbanks
+
+### C++/C#/Rust Zero-Shot推論対応 ✅ NEW (2026-03-31)
+
+C++/C#/Rustの全ネイティブCLIでzero-shot TTS推論（speaker embedding入力）に対応。
+
+**Zero-Shot CLIオプション:**
+| オプション | C++ | C# | Rust | Python | 説明 |
+|-----------|-----|----|----|--------|------|
+| `--speaker-embedding FILE` | ✅ | ✅ | ✅ | ✅ | Speaker embeddingファイル (192 float32, .npy or raw binary) |
+| JSON `speaker_embedding` | ✅ | ✅ | ✅ | ✅ | JSONL入力でembedding配列を直接指定 |
+
+**仕様:**
+- 入力形式: NumPy .npy (v1.0/v2.0) または raw binary (192 × float32 = 768バイト)
+- テンソル形状: `[1, 192]` float32
+- 優先度: `speaker_embedding` > `speaker_id` (sid)
+- フォールバック: embedding未指定時はゼロベクトル（警告あり）
+
+**実装ファイル:**
+- `src/cpp/main.cpp` — C++ CLI (`--speaker-embedding`, `loadSpeakerEmbedding()`, JSON対応)
+- `src/cpp/piper.cpp` — C++ ONNX推論 (speaker_embedding テンソル構築)
+- `src/csharp/PiperPlus.Core/Inference/PiperSession.cs` — C# テンソル構築
+- `src/csharp/PiperPlus.Cli/Program.cs` — C# CLI + JSONL対応
+- `src/rust/piper-core/src/engine.rs` — Rust テンソル構築
+- `src/rust/piper-cli/src/main.rs` — Rust CLI
+- `src/rust/piper-python/src/lib.rs` — Python bindings
+
+### C++/Python CLI UX改善 ✅ (2026-03-16)
+
+C++/Python CLIにモデル管理・テキスト直接入力機能を追加。Windows UTF-8対応。
+
+**新CLIオプション:**
+| オプション | C++ | Python | 説明 |
+|-----------|-----|--------|------|
+| `--text TEXT` | ✅ | - | テキスト直接入力（パイプ不要） |
+| `--list-models [LANG]` | ✅ | ✅ | モデル一覧表示 |
+| `--download-model NAME` | ✅ | ✅ | モデルダウンロード |
+| `--model-dir DIR` | ✅ | - | ダウンロード先指定 |
+| `--version` | ✅ | ✅ | バージョン表示 |
+
+**環境変数:** `PIPER_DEFAULT_MODEL`, `PIPER_DEFAULT_CONFIG`, `PIPER_MODEL_DIR`
+
+**実装ファイル:**
+- `src/cpp/main.cpp` — C++ CLI新オプション
+- `src/cpp/model_manager.cpp/hpp` — モデルカタログ管理
+- `src/python_run/piper/download.py` — Python モデルダウンロード
+- `scripts/speak.bat`, `scripts/speak.ps1` — Windows ヘルパー
+
+### 3段階前処理パイプライン ✅ NEW (2026-03-11)
+
+従来の一体型前処理（~12 utt/s）を3段階に分離して大幅に高速化。合計約10-15分（従来約80分）で5-8倍高速化。
+
+**ステージ1: 音素化（--skip-audio）**
+```bash
+uv run python -m piper_train.preprocess \
+  --input-dir /data/moe-speech-20speakers-ljspeech \
+  --output-dir /data/piper/dataset-zero-shot-20speakers \
+  --language ja --sample-rate 22050 --dataset-format ljspeech \
+  --max-workers 30 --skip-audio
+```
+- 60,233件を1分51秒で完了（538 utt/s）
+- audio pathはNone（後で更新）
+
+**ステージ2: 音声正規化（cache_audio）**
+```bash
+uv run python -m piper_train.tools.cache_audio \
+  --dataset /data/piper/dataset-zero-shot-20speakers/dataset.jsonl \
+  --cache-dir /data/piper/dataset-zero-shot-20speakers/cache/22050 \
+  --sample-rate 22050 \
+  --workers 30
+```
+- Energy VAD + soxr リサンプリング
+- 60,233件を2分20秒で完了（429 it/s）
+- .ptファイル保存、dataset.jsonl自動更新
+
+**ステージ3: スペクトログラム計算（batch_spectrograms）**
+```bash
+uv run python -m piper_train.tools.batch_spectrograms \
+  --cache-dir /data/piper/dataset-zero-shot-20speakers/cache/22050 \
+  --workers 30
+```
+- CPU並列でスペクトログラム計算
+- .spec.ptファイル保存（FP16）
+
+**Energy VADサポート:**
+- `--energy-vad` フラグ（preprocess.pyにデフォルト有効）
+- `--no-energy-vad` でSilero VADにフォールバック
+- `energy_vad_numpy()`: numpy vectorized RMS VAD
+- `cache_norm_audio_fast()`: Energy VAD + soxr（Sileroの50倍高速）
 
-ファインチューニング時に Duration Predictor (DP) の catastrophic forgetting を防止。`--freeze-dp` で DP パラメータを凍結し optimizer から除外。`--resume-from-multispeaker-checkpoint` 使用時は自動有効化。
+**実装ファイル:**
+- `src/python/piper_train/tools/cache_audio.py` — 音声正規化（Energy VAD + soxr）
+- `src/python/piper_train/tools/batch_spectrograms.py` — CPU並列スペクトログラム計算
 
-**注意:** `args.freeze_dp = True` は必ず `VitsModel()` 作成の**前**に設定すること (`save_hyperparameters()` がスナップショットを取るため)。
-
-**CLIオプション:** `--freeze-dp`
-**実装:** `__main__.py`, `vits/lightning.py` (`configure_optimizers()`)
-**テスト:** `tests/test_freeze_dp.py`
-
-### 多言語 Phonemizer (8言語)
-
-`MultilingualPhonemizer` は `UnicodeLanguageDetector` で言語を自動検出し、各言語の Phonemizer に委譲。`models.py` の `gin_channels` 条件は `(num_speakers > 1 or num_languages > 1)` で多言語シングルスピーカーにも対応。
-
-| 言語 | コード | Phonemizer | 依存 |
-|------|--------|------------|------|
-| 日本語 | ja | JapanesePhonemizer | pyopenjtalk |
-| 英語 | en | EnglishPhonemizer | g2p-en (Apache-2.0, espeak-ng互換) |
-| 中国語 | zh | ChinesePhonemizer | pypinyin (MIT) |
-| 韓国語 | ko | KoreanPhonemizer | g2pk2 (Apache-2.0), optional |
-| スペイン語 | es | SpanishPhonemizer | 規則ベース (依存なし) |
-| ポルトガル語 | pt | PortuguesePhonemizer | 規則ベース (依存なし) |
-| フランス語 | fr | FrenchPhonemizer | 規則ベース (依存なし) |
-| スウェーデン語 | sv | SwedishPhonemizer | 規則ベース (依存なし) |
-
-> **Note:** スウェーデン語 (sv) と韓国語 (ko) はG2Pコード実装済みだが、学習済みモデルには未含有 (sv=6, ko=7)。
-
-**実装 (Python):** `src/python/g2p/piper_plus_g2p/multilingual.py`, `piper_plus_g2p/{chinese,korean,spanish,portuguese,french,swedish}.py`
-**実装 (Rust):** `src/rust/piper-g2p/src/multilingual.rs`, `piper-g2p/src/{chinese,korean,spanish,portuguese,french,swedish}.rs`
-**実装 (Go):** `src/go/phonemize/multilingual.go` (`github.com/ayutaz/piper-plus-g2p/phonemize` 独立モジュール)
-**実装 (JS):** `src/wasm/g2p/src/` (`@piper-plus/g2p` パッケージ)
-**Phonemizer ABC (Python):** `piper_plus_g2p/base.py` (抽象基底), `piper_plus_g2p/registry.py` (言語レジストリ)
-**Phonemizer ABC (Rust):** `piper-g2p/src/phonemizer.rs` (`piper_plus_g2p::Phonemizer` トレイト)
-**Phonemizer interface (Go):** `src/go/phonemize/phonemizer.go` (`Phonemizer` インターフェース、独立モジュール `github.com/ayutaz/piper-plus-g2p/phonemize`)
-
-### 言語グループ均等サンプリング (--language-balanced-sampling)
-
-話者数比が不均衡な場合に言語グループ間のバッチバランスを保護。話者数比 >= 3:1 で**自動有効化** (デフォルト)。`--language-balanced-sampling` で強制有効化も可能。
-
-**CLIオプション:** `--language-balanced-sampling`
-**実装:** `vits/dataset.py` (`SpeakerBalancedBatchSampler`), `vits/lightning.py`, `__main__.py`
-
-### FP16 ONNX変換
-
-ONNX エクスポート時にデフォルトで FP16 変換を適用。モデルサイズ ~50% 削減。
-
-**CLIオプション:** `--no-fp16` (FP16変換を無効化)
-**実装:** `export_onnx.py`
-
-### emb_lang 自動統一 (--unify-emb-lang)
-
-シングルスピーカー多言語モデルのONNXエクスポート時に、`emb_lang` を自動統一。ソース言語 (デフォルト: lang[0]) の embedding を全言語にコピーして声質を統一する。`num_speakers <= 1 and num_languages > 1` で自動有効化。
-
-**CLIオプション:** `--unify-emb-lang` / `--no-unify-emb-lang` (デフォルト: auto), `--unify-emb-lang-source N` (デフォルト: 0)
-**実装:** `export_onnx.py` (`should_unify_emb_lang()`, `unify_emb_lang_weights()`)
-**テスト:** `tests/test_export_onnx.py` (`TestUnifyEmbLang`, `TestUnifyEmbLangOnnxExport`)
-
-### WavLM Discriminator (--no-wavlm)
-
-Microsoft WavLMベースの知覚品質判別器。デフォルト有効。学習時のみ使用 (推論グラフには含まれない)。GPUメモリ追加 ~1-2GB/GPU。V100では `--no-wavlm` 推奨 (学習速度優先)。
-
-**CLIオプション:** `--no-wavlm`, `--wavlm-every-n-steps N` (デフォルト: 1), `--c-wavlm` (デフォルト: 0.5)
-**実装:** `vits/models.py` (`WavLMDiscriminator`), `vits/lightning.py`, `__main__.py`
-
-### WandB Audio Logging (--audio-log-epochs)
-
-Validation時に音声サンプルをWandBに自動アップロード。DDP環境では `--audio-log-epochs 5` 推奨 (barrier同期済み)。
-
-**CLIオプション:** `--audio-log-epochs N` (デフォルト: 1, 0で無効化), `--num-test-examples N` (デフォルト: 2)
-**実装:** `vits/lightning.py` (`on_validation_epoch_end()`), `__main__.py` (WandbLogger設定)
-
-### テキスト直接入力推論 (--text)
-
-`infer_onnx.py` に `--text` オプション追加。JSONLなしでテキストから直接音声生成。
-
-**CLIオプション:** `--text`, `--config`, `--speaker-id`, `--language`
-**実装:** `infer_onnx.py`
-
-### prosody_features (A1/A2/A3) (--prosody-dim)
-
-OpenJTalkから抽出されるA1/A2/A3値をDuration Predictorの入力として活用。デフォルト有効 (`--prosody-dim 16`)。
-
-**CLIオプション:** `--prosody-dim N` (デフォルト: 16)
-**前処理:** `uv run python /data/piper/add_prosody_features.py --input-dataset ... --output-dir ...`
-**実装:** `vits/models.py`, `vits/lightning.py`
-
-### 転移学習 (--resume-from-multispeaker-checkpoint)
-
-マルチスピーカー -> シングルスピーカー転移の専用フラグ。自動で emb_g 除去 + emb_lang 補正 + freeze-dp 有効化を実行。
-
-**推奨ワークフロー:**
-1. **学習時**: `--resume-from-multispeaker-checkpoint` で全言語の emb_lang を保持 (凍結 DP が正しい conditioning を受け取る)
-2. **ONNXエクスポート時**: `export_onnx` が `--unify-emb-lang` (自動有効化) で `emb_lang[0]` → `emb_lang[1:N]` にコピーして声質を統一
-
-**CLIオプション:** `--resume-from-multispeaker-checkpoint <path>`
-**実装:** `__main__.py`
-
-### エネルギーVAD高速キャッシュ
-
-LibriTTS-R の音声キャッシュを Silero ONNX VAD から numpy エネルギーVAD に置き換え。25倍高速化 (~390ms/file -> ~8ms/file)。
-
-**実装:** `norm_audio/__init__.py`, `src/python/piper_train/tools/prepare_bilingual_dataset.py`
-
-### 疑問詞マーカー拡張 (Issue #204)
-
-日本語疑問文の種類を区別するマーカー: `?!` (強調疑問), `?.` (平叙疑問), `?~` (確認疑問)。
-
-**実装:** `phonemize/japanese.py` (`_get_question_type()`)
-
-### 文脈依存N phoneme variants (Issue #207)
-
-「ん」の発音を後続音により4バリアントに分類: N_m (両唇音前), N_n (歯茎音前), N_ng (軟口蓋音前), N_uvular (語末/母音前)。
-
-**実装:** `phonemize/japanese.py` (`_apply_n_phoneme_rules()`), `phonemize/jp_id_map.py`, `phonemize/token_mapper.py`
-
-### 学習高速化
-
-Validation頻度削減、DataLoader最適化 (num_workers=2, pin_memory)、LRスケジューラ修正、DDP `find_unused_parameters=True` に修正。
-
-**CLIオプション:** `--val-every-n-epochs N` (デフォルト: 5), `--limit-val-batches N` (デフォルト: 50), `--num-workers N` (デフォルト: 2), `--no-pin-memory`
-**実装:** `__main__.py`, `vits/lightning.py`, `vits/dataset.py`
-
-### C# CLI (PiperPlus)
-
-8言語マルチリンガル対応のクロスプラットフォーム .NET CLI。Python実装と同等の音素化パイプラインを C# で再実装。
-
-| 項目 | 詳細 |
-|------|------|
-| TFM | PiperPlus.Core: net8.0, PiperPlus.Cli: net9.0 |
-| 対応言語 | JA, EN, ZH, KO, ES, FR, PT, SV (8言語) |
-| G2P依存 | DotNetG2P v1.8.0 (JA), DotNetG2P.MeCab v1.8.0 (JA), DotNetG2P.English v1.8.0 (EN), DotNetG2P.Chinese/Spanish/French/Portuguese v1.7.0 |
-| テスト | 829テスト (xUnit v3) |
-| CI | 3 OS × 2 .NET バージョン (csharp-ci.yml) |
-| ビルド | `dotnet build src/csharp/PiperPlus.sln` |
-
-**実装:** `src/csharp/PiperPlus.Core/`, `src/csharp/PiperPlus.Cli/`
-
-**追加機能:**
-- `lid` (言語ID) テンソル対応: マルチリンガルモデルで `language_id_map` から自動解決
-- OpenJTalk 辞書自動ダウンロード: C++ `openjtalk_dictionary_manager.c` と同等の辞書検索・自動DL機能
-- ストリーミング文分割: `TextSplitter.SplitSentences()` で文ごとに逐次合成 (`--streaming`)
-- カスタム辞書: JSON v1.0/v2.0 (C++/Rust互換) + TSV 形式対応 (`--custom-dict`)
-- `[[ phoneme ]]` インライン音素記法: テキスト中に直接音素を指定可能
-- モデル名自動解決: `--model tsukuyomi` でエイリアス検索 + 自動DL
-
-### Rust 推論エンジン (piper-plus)
-
-Rust によるONNX推論エンジン。ストリーミング、CUDA/CoreML/DirectML対応。PyO3 による Python バインディング提供。
-
-| 項目 | 詳細 |
-|------|------|
-| クレート | piper-plus, piper-plus-cli, piper-plus-python |
-| 対応言語 | JA, EN, ZH, KO, ES, FR, PT, SV (8言語) |
-| 特徴 | ストリーミング、GPU推論、WASM対応 |
-| CI | 3 OS (rust-tests.yml) |
-| ビルド | `cargo build --release -p piper-plus-cli` |
-
-**デフォルトfeature:** `naist-jdic` (JA辞書バンドル) + `dict-download` (OpenJTalk辞書自動DL、C#/C++用)。jpreprocess は lindera 形式辞書を使用するため、OpenJTalk MeCab 形式とは非互換。`PIPER_OFFLINE_MODE=1` で自動DL無効化可能。
-
-**追加機能:**
-- カスタム辞書: JSON v1.0/v2.0 対応、`--custom-dict` でCLI統合済み
-- バイナリビルドCI: PR時3プラットフォーム、リリース時5ターゲット
-- モデル名自動解決: `--model tsukuyomi` でエイリアス検索 + 自動DL
-- `--download-model` / `--model-dir`: モデルダウンロード管理
-- `--quiet` / `--test-mode` / `--output-raw`: デバッグ・CI対応
-- `--sentence-silence` / `--phoneme-silence`: 無音制御
-- `--list-models` 言語フィルタ: `--list-models ja`
-- 環境変数: PIPER_DEFAULT_MODEL, PIPER_DEFAULT_CONFIG, PIPER_MODEL_DIR
-
-**実装:** `src/rust/piper-core/`, `src/rust/piper-cli/`, `src/rust/piper-python/`
-
-### Go 推論エンジン (piper-plus)
-
-Go 1.26+ による ONNX 推論エンジン。ストリーミング、CUDA/CoreML/DirectML/TensorRT 対応。HTTP API サーバー内蔵。
-
-| 項目 | 詳細 |
-|------|------|
-| モジュール | `github.com/ayutaz/piper-plus/src/go` |
-| 対応言語 | JA, EN, ZH, KO, ES, FR, PT, SV (8言語) |
-| G2P | `github.com/ayutaz/piper-plus-g2p/phonemize` (独立モジュール、他TTSエンジンからも利用可能) |
-| 特徴 | ストリーミング、GPU推論、HTTP API、VoicePool (並行処理)、音素タイミング出力 |
-| ビルド | `go build ./src/go/cmd/piper-plus` |
-
-**追加機能:**
-- VoicePool: 並行合成のためのセッションプール (`NewVoicePool`)
-- HTTP API サーバー: `GET/POST /synthesize`, `GET /health`, `GET /info`
-- 音素タイミング出力: JSON/TSV 形式 (`--output-timing`)
-- モデル管理: 自動 DL + キャッシュ (`ModelManager`)
-- 環境変数: ONNX_RUNTIME_SHARED_LIBRARY_PATH, PIPER_DEFAULT_MODEL, PIPER_MODEL_DIR
-
-**実装:** `src/go/piperplus/`, `src/go/cmd/piper-plus/`
-**G2P 実装 (独立モジュール):** `src/go/phonemize/`
-
-### JavaScript/WASM npm パッケージ (piper-plus)
-
-ブラウザ内で完全オフラインの多言語 TTS を `npm install piper-plus` で利用可能にする npm パッケージ。eSpeak-ng 不使用 (GPL リスク回避)。
-
-| 項目 | 詳細 |
-|------|------|
-| パッケージ名 | piper-plus |
-| バージョン | 0.1.1 |
-| 対応言語 | JA, EN, ZH, KO, ES, FR, PT, SV (8言語) |
-| 音素化 | @piper-plus/g2p (OpenJTalk WASM: JA, IPA規則ベース: EN/ZH/KO/ES/FR/PT/SV) |
-| 推論 | onnxruntime-web (peerDependency) |
-| テスト | 282テスト (Node.js test runner) |
-| CI | ci.yml (PR/push), npm-publish.yml (タグトリガー) |
-| ビルド | ブラウザ専用 (Node.js 非対応) |
-
-**コアクラス:**
-- `PiperPlus` — 高レベル API (initialize → synthesize → AudioResult)
-- `ModelManager` — HuggingFace モデル DL + IndexedDB キャッシュ
-- `DictManager` — OpenJTalk 辞書 DL + IndexedDB キャッシュ
-- `AudioResult` — WAV エンコード + 再生 + ダウンロード
-- `G2P` (@piper-plus/g2p) — 8言語音素化 (eSpeak-ng 不使用)
-
-**実装:** `src/wasm/openjtalk-web/src/`, `src/wasm/openjtalk-web/types/index.d.ts`
-**テスト:** `src/wasm/openjtalk-web/test/js/test-*.js` (282テスト)
-**npm README:** `src/wasm/openjtalk-web/README.npm.md`
-**設計ドキュメント:** `docs/design/npm-package-plan.md`
+### Zero-Shot TTS (Dual-Mode Speaker Conditioning) ✅ (2026-03-17 更新)
+
+マルチスピーカーモデルでデフォルト有効（フラグ不要）。`emb_g` (nn.Embedding) と `spk_proj` (2-layer MLP) が同一モデルに共存し、speaker ID指定とspeaker embedding指定の両方で推論可能。
+
+**特徴:**
+- ONNX変換時に `--export-mode {auto, zero-shot, sid}` で推論モードを分離
+- gin_channels=512（768ではガビガビ音発生）
+- Speaker Encoder: CAM++ ONNX (27MB, 192次元, Apache-2.0)
+- Per-utterance embedding抽出で学習-推論条件を一致
+- spk_proj は 2-layer MLP (`Linear(192,512) -> LayerNorm -> GELU -> Linear(512,512)`)
+- `_get_speaker_condition` で L2正規化は不要（MLP がスケーリングを学習）
+- SCL (Speaker Consistency Loss): `--speaker-encoder-path` 指定時に有効。CAM++ ONNX (CPU) で生成音声からspeaker embeddingを抽出し、コサイン類似度で話者一貫性を評価
+- DINO 自己蒸留: EMA teacher (`spk_proj_teacher`, momentum=0.996) で話者埋め込み空間を正則化
+- CamPPSpeakerEncoder: CPU ONNX ラッパー（非nn.Module、state_dict/checkpointに含まれない）
+- spk_emb_dropout: 学習時にspeaker embeddingを確率的にドロップし emb_g も学習（デフォルト 0.5）
+
+**実装ファイル:**
+- `src/python/piper_train/vits/models.py` — Dual-mode SynthesizerTrn, spk_proj MLP
+- `src/python/piper_train/vits/lightning.py` — CamPPSpeakerEncoder, SCL, DINO, VitsModel
+- `src/python/piper_train/vits/losses.py` — speaker_consistency_loss, dino_loss
+- `src/python/piper_train/export_onnx.py` — `--export-mode` フラグ
+- `src/python/piper_train/extract_speaker_embedding.py` — CAM++ embedding抽出（個別推論）
+- `src/python/piper_train/prepare_zero_shot_dataset.py` — 複数コーパス統合
+
+### Phonemizer ABC + 言語レジストリ ✅ (2026-02-01)
+
+`Phonemizer` 抽象基底クラスと言語レジストリにより、if/elif分岐を解消。新言語追加が容易に。
+
+**新言語追加手順:**
+1. `Phonemizer` を継承したクラスを作成 (`phonemize`, `phonemize_with_prosody`, `get_phoneme_id_map` を実装)
+2. 必要に応じて `post_process_ids` をオーバーライド (BOS/EOS等)
+3. `registry.py` の `_auto_register()` に登録
+
+**実装ファイル:**
+- `src/python/piper_train/phonemize/base.py` — `Phonemizer` ABC, 共通 `ProsodyInfo`
+- `src/python/piper_train/phonemize/registry.py` — 言語レジストリ
+- `src/python/piper_train/phonemize/japanese.py` — `JapanesePhonemizer`
+- `src/python/piper_train/phonemize/english.py` — `EnglishPhonemizer`
+- `src/python/tests/test_phonemizer_registry.py` — レジストリ・ABCテスト
+
+### GPL-free 英語G2P (g2p-en) ✅ (2026-01-31)
+
+g2p-en (Apache-2.0) を使用したespeak-ng互換の英語音素化。espeak-ng/piper-phonemize (GPL) なしで英語推論が可能。
+
+**実装ファイル:**
+- `src/python/piper_train/phonemize/english.py` — G2P変換
+- `src/python/piper_train/infer_onnx.py` — BOS/EOS・パディング挿入
+- `src/python/tests/test_english_phonemizer.py` — 42テスト
+
+### WavLM Discriminator ✅ (2026-01-08)
+
+Microsoft WavLMベースの知覚品質判別器。`--no-wavlm` で無効化可能。
+
+**実装ファイル:**
+- `src/python/piper_train/vits/models.py` - `WavLMDiscriminator`クラス
+- `src/python/piper_train/vits/lightning.py` - 学習ループ統合
+
+### テキスト直接入力推論 ✅ (2026-01-08)
+
+`infer_onnx.py`に`--text`オプション追加。JSONLなしでテキストから直接音声生成。
+
+### Issue #204: 疑問詞マーカーの拡張 ✅
+
+日本語の疑問文の種類を区別するマーカー (`?!`, `?.`, `?~`)。
+
+### Issue #207: 文脈依存「ん」(N) バリアント ✅
+
+「ん」の発音が後続音によって変わることを反映 (`N_m`, `N_n`, `N_ng`, `N_uvular`)。
+
+### prosody_features (A1/A2/A3) モデル統合 ✅
+
+OpenJTalkから抽出されるA1/A2/A3値をDuration Predictorの入力として活用。
+
+**A1/A2/A3の意味:**
+
+| フィールド | 意味 | 値の例 |
+|-----------|------|--------|
+| A1 | アクセント核からの相対位置 | -4, -3, ..., 0, 1, ... |
+| A2 | アクセント句内のモーラ位置 | 1, 2, 3, ... |
+| A3 | アクセント句内の総モーラ数 | 1-10+ |
+
+**デフォルト有効:** `--prosody-dim 16`
+
+### SpeakerBalancedBatchSampler ✅
+
+マルチスピーカーモデルのDuration Predictor崩壊問題を解決するカスタムバッチサンプラー。
+
+### FP16 Mixed Precision ✅
+
+デフォルトで有効。学習速度2-3倍向上、GPUメモリ約50%削減。
+
+---
+
+## 学習設定
+
+### 推奨設定 (20話者、T4 15GB × 4、Zero-Shot事前学習用) ✅ 最新
+
+```bash
+NCCL_DEBUG=WARN NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+uv run python -m piper_train \
+  --dataset-dir /data/piper/dataset-zero-shot-20speakers \
+  --prosody-dim 16 \
+  --accelerator gpu --devices 4 --precision 16-mixed \
+  --max_epochs 200 --batch-size 20 --samples-per-speaker 4 \
+  --checkpoint-epochs 2 --quality medium \
+  --base_lr 2e-4 --disable_auto_lr_scaling \
+  --ema-decay 0.9995 --num-workers 4 --no-pin-memory \
+  --no-wavlm --no-compile \
+  --max-spec-length 500 \
+  --kl-annealing-epochs 10 \
+  --speaker-encoder-path /data/piper/models/campplus.onnx \
+  --c-spk 1.0 --c-dino 0.5 \
+  --default_root_dir /data/piper/output-zero-shot-20speakers
+```
+
+**T4 × 4 メモリ対策:**
+- `--num-workers 4`: DDP × 4GPU = 16ワーカー (val用は自動で2に制限)
+- `--no-pin-memory`: ロックRAM使用を回避
+- `--no-compile`: T4ではtorch.compileのオーバーヘッドが大きい
+- `--batch-size 20`: T4の15GB VRAMに安全に収まるサイズ
+- `--max-spec-length 500`: 長すぎる発話を除外してOOM防止
+
+**SCL / DINO / KLアニーリング設定:**
+- `--speaker-encoder-path`: CAM++ ONNXモデルのパスを指定するとSCL有効化
+- `--c-spk 1.0`: SCL重み（デフォルト1.0、非微分SCL用）
+- `--c-dino 0.5`: DINO自己蒸留重み（デフォルト0.5、Phase 1の0.1から引き上げ）
+- `--spk-emb-dropout 0.5`: speaker embeddingドロップ率（デフォルト、dual-mode学習用）
+- `--kl-annealing-epochs 10`: KL重みを0.1→1.0へ10エポックかけて線形増加（0で無効化）
+
+注: `--zero-shot` フラグは不要（マルチスピーカーなら自動有効化）
+
+### GPU別の推奨設定
+
+| パラメータ | T4 (15GB × 4) | V100 (16GB × 4) | RTX 6000 Ada (48GB × 1) |
+|---|---|---|---|
+| `--devices` | **4** | 4 | 1 |
+| `--precision` | **`16-mixed`** | `16-mixed` | `bf16-mixed` |
+| `--batch-size` | **20** | 12 | 160 |
+| `--samples-per-speaker` | **4** | 2 | 8 |
+| `--num-workers` | **4** | 0 | 8 |
+| `--no-pin-memory` | **必須** | 必須 | 不要 |
+| `--no-compile` | **推奨** | 推奨 | 不要 |
+
+**DDP multi-GPU メモリ注意事項:**
+- total workers = `--num-workers` × `--devices` (persistent_workers=True)
+- 4GPU時に `--num-workers 12` = 48ワーカー → OOM危険
+- 4GPU時は `--num-workers 2-4 --no-pin-memory` を推奨
+
+### 話者数別の推奨設定
+
+| 話者数 | batch_size | samples_per_speaker | 実効バッチ | 備考 |
+|-------|------------|---------------------|-----------|------|
+| 5話者 | 20 | 4 | 20 | ✅ 検証済み |
+| **20話者 (T4×4)** | **20** | **4** | **80** | Zero-Shot推奨 |
+| **20話者 (Ada×1)** | **160** | **8** | **160** | RTX 6000 Ada推奨 |
+| 20話者 (旧) | 32 | 4 | 32 | WavLMあり |
 
 ---
 
@@ -407,115 +500,37 @@ Go 1.26+ による ONNX 推論エンジン。ストリーミング、CUDA/CoreML
 |------|------|
 | 学習スクリプト | `src/python/piper_train/__main__.py` |
 | VITS実装 | `src/python/piper_train/vits/` |
+| 損失関数 (SCL, DINO) | `src/python/piper_train/vits/losses.py` |
+| EMAコールバック (dec + spk_proj) | `src/python/piper_train/vits/ema.py` |
+| Phonemizer ABC | `src/python/piper_train/phonemize/base.py` |
+| 言語レジストリ | `src/python/piper_train/phonemize/registry.py` |
+| 英語音素化 | `src/python/piper_train/phonemize/english.py` |
+| 日本語音素化 | `src/python/piper_train/phonemize/japanese.py` |
+| IDマップ | `src/python/piper_train/phonemize/jp_id_map.py` |
+| トークンマッパー | `src/python/piper_train/phonemize/token_mapper.py` |
 | ONNXエクスポート | `src/python/piper_train/export_onnx.py` |
 | 推論スクリプト | `src/python/piper_train/infer_onnx.py` |
-| G2P パッケージ (Python) | `src/python/g2p/piper_plus_g2p/` (piper-g2p スタンドアロンパッケージ) |
-| 多言語Phonemizer (Python) | `src/python/g2p/piper_plus_g2p/multilingual.py` |
-| 各言語Phonemizer (Python) | `src/python/g2p/piper_plus_g2p/{japanese,english,chinese,korean,spanish,portuguese,french,swedish}.py` |
-| クロスプラットフォームテスト | `src/python/g2p/tests/test_cross_platform.py` |
+| Speaker Embedding抽出 | `src/python/piper_train/extract_speaker_embedding.py` |
+| Zero-shotデータ準備 | `src/python/piper_train/prepare_zero_shot_dataset.py` |
 
-### C# ソースコード
+### データセット・モデル
 
 | 用途 | パス |
 |------|------|
-| ソリューション | `src/csharp/PiperPlus.sln` |
-| コアライブラリ | `src/csharp/PiperPlus.Core/` |
-| CLI アプリケーション | `src/csharp/PiperPlus.Cli/` |
-| テスト | `src/csharp/PiperPlus.Core.Tests/` |
-| ONNX推論 | `src/csharp/PiperPlus.Core/Inference/` |
-| 日本語音素化 | `src/csharp/PiperPlus.Core/Phonemize/JapanesePhonemizer.cs` |
-| 英語音素化 | `src/csharp/PiperPlus.Core/Phonemize/EnglishPhonemizer.cs` |
-| 中国語音素化 | `src/csharp/PiperPlus.Core/Phonemize/ChinesePhonemizer.cs` |
-| スペイン語音素化 | `src/csharp/PiperPlus.Core/Phonemize/SpanishPhonemizer.cs` |
-| ポルトガル語音素化 | `src/csharp/PiperPlus.Core/Phonemize/PortuguesePhonemizer.cs` |
-| フランス語音素化 | `src/csharp/PiperPlus.Core/Phonemize/FrenchPhonemizer.cs` |
-| 韓国語音素化 | `src/csharp/PiperPlus.Core/Phonemize/KoreanPhonemizer.cs` |
-| マルチリンガルPhonemizer | `src/csharp/PiperPlus.Core/Phonemize/MultilingualPhonemizer.cs` |
-| PUAマッピング | `src/csharp/PiperPlus.Core/Mapping/OpenJTalkToPiperMapping.cs` |
-| 設定管理 | `src/csharp/PiperPlus.Core/Config/` |
-| 辞書マネージャ | `src/csharp/PiperPlus.Core/Config/DictionaryManager.cs` |
-| テキスト分割 | `src/csharp/PiperPlus.Core/Phonemize/TextSplitter.cs` |
-| インライン音素パーサー | `src/csharp/PiperPlus.Core/Phonemize/InlinePhonemeParser.cs` |
-| Raw音素パーサー | `src/csharp/PiperPlus.Core/Phonemize/RawPhonemeParser.cs` |
-| モデルマネージャ | `src/csharp/PiperPlus.Core/Config/ModelManager.cs` |
-
-### Rust ソースコード
-
-| 用途 | パス |
-|------|------|
-| ワークスペース | `src/rust/Cargo.toml` |
-| コアライブラリ | `src/rust/piper-core/` |
-| CLI アプリケーション | `src/rust/piper-cli/` |
-| Python バインディング | `src/rust/piper-python/` |
-| G2P クレート | `src/rust/piper-g2p/` (piper-g2p スタンドアロンクレート) |
-| G2P Phonemizer トレイト | `src/rust/piper-g2p/src/phonemizer.rs` |
-| G2P 多言語 | `src/rust/piper-g2p/src/multilingual.rs` |
-| G2P adapter (piper-core) | `src/rust/piper-core/src/phonemize/adapter.rs` |
-| 推論エンジン | `src/rust/piper-core/src/engine.rs` |
-| 辞書マネージャ | `src/rust/piper-core/src/dictionary_manager.rs` |
-| カスタム辞書テスト | `src/rust/piper-core/tests/test_custom_dict_integration.rs` |
-| デフォルト出力テスト | `src/rust/piper-core/tests/test_default_output.rs` |
-| G2P ゴールデンテスト | `src/rust/piper-core/tests/test_g2p_golden.rs` |
-
-### Go ソースコード
-
-| 用途 | パス |
-|------|------|
-| モジュールルート | `src/go/` (モジュール: `github.com/ayutaz/piper-plus/src/go`) |
-| CLI アプリケーション | `src/go/cmd/piper-plus/` |
-| コアライブラリ | `src/go/piperplus/` |
-| G2P モジュール (独立) | `src/go/phonemize/` (モジュール: `github.com/ayutaz/piper-plus-g2p/phonemize`、他TTSエンジンからも利用可能) |
-| G2P Phonemizer インターフェース | `src/go/phonemize/phonemizer.go` |
-| G2P 多言語 | `src/go/phonemize/multilingual.go` |
-| G2P 各言語 | `src/go/phonemize/{japanese,english,chinese,korean,spanish,portuguese,french,swedish}.go` |
-| 推論エンジン | `src/go/piperplus/engine.go` |
-| モデルマネージャ | `src/go/piperplus/model_manager.go` |
-| HTTP サーバー | `src/go/piperplus/server.go` |
-| README | `src/go/README.md` |
-
-### npm パッケージ ソースコード
-
-| 用途 | パス |
-|------|------|
-| エントリーポイント | `src/wasm/openjtalk-web/src/index.js` |
-| モデルマネージャ | `src/wasm/openjtalk-web/src/model-manager.js` |
-| 辞書マネージャ | `src/wasm/openjtalk-web/src/dict-manager.js` |
-| 音声結果 | `src/wasm/openjtalk-web/src/audio-result.js` |
-| TypeScript型定義 | `src/wasm/openjtalk-web/types/index.d.ts` |
-| npm パッケージ設定 | `src/wasm/openjtalk-web/package.json` |
-| npm publish CI | `.github/workflows/npm-publish.yml` |
-| G2P パッケージ (JS) | `src/wasm/g2p/` (@piper-plus/g2p パッケージ) |
-| G2P エントリーポイント | `src/wasm/g2p/src/index.js` |
-| G2P ゴールデンテスト | `src/wasm/openjtalk-web/test/js/test-g2p-golden.js` |
-| 音声回帰テスト | `src/wasm/openjtalk-web/test/js/test-audio-regression.js` |
-| 音声回帰ベースライン | `tests/fixtures/g2p/audio-regression-baseline.json` |
-| クロスプラットフォームフィクスチャ | `tests/fixtures/g2p/phoneme_test_cases.json` |
-
-### データセット
-
-| 用途 | パス | 発話数 | 特徴 |
-|------|------|--------|------|
-| **多言語 6lang** | `/data/piper/dataset-multilingual-6lang-filtered/` | 508,187 | JA+EN+ZH+ES+FR+PT、571話者、173シンボル、>=30発話/話者 |
-| **つくよみちゃん 6langベース finetune** | `/data/piper/dataset-tsukuyomi-finetune-6lang/` | 100 | 1話者、173シンボル、multilingual(6言語) |
-| バイリンガル JA+EN v4 (参照) | `/data/piper/dataset-bilingual-ja-en-v4/` | 135,060 | JA 60,148 (20話者) + EN 74,912 (310話者)、6langの入力データ |
-
-### 学習済みモデル
-
-| 用途 | パス | 状態 |
-|------|------|------|
-| **つくよみちゃん 6lang-v2** | `/data/piper/output-tsukuyomi-finetune-6lang-v2/tsukuyomi-6lang-v2-fixed.onnx` | 500 epoch完了 (2026-03-16) -- emb_lang後処理済み、全6言語テスト成功 |
-| **多言語 6lang ベースモデル** | `/data/piper/output-multilingual-6lang/` | 75 epoch完了 (2026-03-16) -- epoch=74-step=504712.ckpt、571話者 |
-| **CSS10 JA 6lang** | `/data/piper/css10-ja-ljspeech/` -> `test/models/multilingual-test-medium.onnx` | 50 epoch完了 (2026-03-16) -- 6langベースから転移、6,841発話 |
-| バイリンガル JA+EN v4 (参照) | `/data/piper/output-bilingual-ja-en-v4/bilingual-ja-en-v4-150epoch.onnx` | 150 epoch完了 (75MB, 2026-03-04) -- EMA適用済み |
+| **Zero-Shot 20話者** ✅最新 | `/data/piper/dataset-zero-shot-20speakers/` |
+| 20話者 (embedding付き) | `/home/shadeform/data/piper/dataset-moe-speech-20speakers/` |
+| 20話者 v2 | `/home/shadeform/data/piper/dataset-moe-speech-20speakers-v2/` |
+| CAM++ ONNXモデル | `/data/piper/models/campplus.onnx` (新) / `/home/shadeform/data/piper/models/campplus.onnx` (旧) |
+| 20話者 v2 ONNX | `/home/shadeform/data/piper/output-moe-speech-20speakers-v2/moe-speech-20speakers-v2.onnx` |
+| つくよみちゃん | HuggingFace: `ayousanz/piper-plus-tsukuyomi-chan` |
 
 ### 便利ツール
 
-| ツール | パス | 用途 |
-|--------|------|------|
-| `prepare_multilingual_dataset.py` | `src/python/piper_train/tools/prepare_multilingual_dataset.py` | 6言語マルチリンガルデータセット作成 |
-| `add_prosody_features.py` | `src/python/piper_train/tools/add_prosody_features.py` | 既存データセットにprosody_features追加+phoneme_ids再生成 |
-| `prepare_bilingual_dataset.py` | `src/python/piper_train/tools/prepare_bilingual_dataset.py` | JA+ENバイリンガルデータセット作成 |
-| `prepare_libritts_parallel.py` | `/data/piper/prepare_libritts_parallel.py` | LibriTTS-R -> LJSpeech形式変換（並列処理） |
+| ツール | 実行コマンド | 用途 |
+|--------|-------------|------|
+| `piper_train.tools.add_prosody_features` | `uv run python -m piper_train.tools.add_prosody_features` | 既存データセットにprosody_features追加＋phoneme_ids再生成 |
+| `piper_train.tools.cache_audio` | `uv run python -m piper_train.tools.cache_audio` | 音声正規化（Energy VAD + soxr リサンプリング） |
+| `piper_train.tools.batch_spectrograms` | `uv run python -m piper_train.tools.batch_spectrograms` | CPU並列スペクトログラム計算 |
 
 ---
 
@@ -524,65 +539,75 @@ Go 1.26+ による ONNX 推論エンジン。ストリーミング、CUDA/CoreML
 ### ONNX変換
 
 ```bash
-# 通常エクスポート（EMA + stochastic、デフォルト推奨）
+# Speaker ID モード（従来互換）
 CUDA_VISIBLE_DEVICES="" uv run python -m piper_train.export_onnx \
-  /path/to/checkpoint.ckpt \
-  /path/to/output.onnx
+  --export-mode sid \
+  /path/to/checkpoint.ckpt /path/to/output_sid.onnx
 
-# deterministic（デバッグ用）
+# Zero-shot モード（speaker embedding入力）
 CUDA_VISIBLE_DEVICES="" uv run python -m piper_train.export_onnx \
-  --no-stochastic \
-  /path/to/checkpoint.ckpt \
-  /path/to/output.onnx
+  --export-mode zero-shot \
+  /path/to/checkpoint.ckpt /path/to/output_zs.onnx
 ```
 
 | オプション | デフォルト | 説明 |
 |-----------|----------|------|
-| `--no-stochastic` | - | deterministic エクスポート（デバッグ用） |
-| `--no-fp16` | - | FP16変換を無効化（デフォルト: FP16有効、モデルサイズ~50%削減） |
-| `--unify-emb-lang` / `--no-unify-emb-lang` | auto | emb_lang 自動統一（シングルスピーカー多言語モデルで自動有効化） |
-| `--unify-emb-lang-source N` | 0 | emb_lang 統一のソース言語インデックス |
-| `--simplify` | - | ONNX モデル simplification を適用 |
-| `--debug` | - | デバッグログ出力 |
-| EMA | 常時有効 | チェックポイントに EMA state があれば自動適用（CLIオプションではない） |
+| `--export-mode` | `auto` | `auto`: 自動判定, `sid`: speaker ID入力, `zero-shot`: speaker embedding入力 |
+| `--stochastic` | off | noise_scaleによるサンプリングを有効化 |
+| `--use-ema` | on | チェックポイントのEMA重みをデコーダに適用 |
+| `--no-ema` | - | EMA重み適用を無効化 |
 
-### 推論テスト (6lang マルチリンガルモデル)
+### 推論テスト
 
-**日本語 (speaker_id=0, JA話者):**
 ```bash
+# Speaker ID指定（従来方式）
 CUDA_VISIBLE_DEVICES="" uv run python -m piper_train.infer_onnx \
-  --model /data/piper/output-multilingual-6lang/multilingual-6lang-75epoch.onnx \
-  --config /data/piper/dataset-multilingual-6lang-filtered/config.json \
-  --output-dir /home/jovyan \
+  --model /path/to/sid_model.onnx \
+  --config /path/to/config.json \
+  --output-dir /path/to/output \
   --text "こんにちは、今日は良い天気ですね。" \
-  --language ja-en-zh-es-fr-pt --speaker-id 0 --noise-scale 0.667
-```
+  --speaker-id 0
 
-**注意:** `--language` の言語コード順は任意（内部で canonical key に正規化される）。
-
-**英語 (speaker_id=20, EN話者の先頭):**
-```bash
+# Zero-shot推論（参照音声から自動embedding抽出）
 CUDA_VISIBLE_DEVICES="" uv run python -m piper_train.infer_onnx \
-  --model /data/piper/output-multilingual-6lang/multilingual-6lang-75epoch.onnx \
-  --config /data/piper/dataset-multilingual-6lang-filtered/config.json \
-  --output-dir /home/jovyan \
-  --text "Hello, how are you today?" \
-  --language ja-en-zh-es-fr-pt --speaker-id 20 --noise-scale 0.667
+  --model /path/to/zero_shot_model.onnx \
+  --config /path/to/config.json \
+  --output-dir /path/to/output \
+  --text "こんにちは、今日は良い天気ですね。" \
+  --speaker-audio /path/to/reference.wav \
+  --speaker-encoder /path/to/campplus.onnx
+
+# JSONL入力
+cat test.jsonl | CUDA_VISIBLE_DEVICES="" uv run python -m piper_train.infer_onnx \
+  --model /path/to/model.onnx \
+  --output-dir /path/to/output
 ```
 
-**JSONL入力 (phoneme_ids直接指定):**
 ```bash
-cat /path/to/test.jsonl | \
-  CUDA_VISIBLE_DEVICES="" uv run python -m piper_train.infer_onnx \
-    --model /path/to/model.onnx \
-    --output-dir /path/to/output
+# C++ zero-shot推論（speaker embeddingファイル指定）
+./piper -m /path/to/zero_shot_model.onnx -c /path/to/config.json \
+  --text "こんにちは、今日は良い天気ですね。" \
+  --speaker-embedding /path/to/speaker.npy \
+  -f output.wav
+
+# C# zero-shot推論
+dotnet PiperPlus.Cli -m /path/to/zero_shot_model.onnx -c /path/to/config.json \
+  --text "こんにちは、今日は良い天気ですね。" \
+  --speaker-embedding /path/to/speaker.npy \
+  --output-file output.wav
+
+# Rust zero-shot推論
+piper-plus-cli -m /path/to/zero_shot_model.onnx -c /path/to/config.json \
+  --text "こんにちは、今日は良い天気ですね。" \
+  --speaker-embedding /path/to/speaker.npy \
+  -f output.wav
 ```
 
-**JSONLフォーマット (1行1発話):**
-```json
-{"phoneme_ids": [1, 8, 5, 39, ...], "speaker_id": 0, "prosody_features": [{"a1": -2, "a2": 1, "a3": 5}, ...]}
-```
-`phoneme_ids` は必須。`speaker_id` (デフォルト: 0)、`prosody_features` (省略時はゼロ) は任意。
+**Zero-shot推論の注意:**
+- `--speaker-audio`: 参照音声WAVファイル。CAM++で自動的にspeaker embeddingを抽出（Python CLI）
+- `--speaker-encoder`: CAM++ ONNXモデルのパス。未指定時はモデルファイル近傍で `campplus.onnx` を自動検索（Python CLI）
+- `--speaker-embedding`: 事前生成した192次元embeddingファイル（.npy or raw binary）。全言語CLI対応
+- speaker_embedding.npy: 192次元float32配列。`extract_speaker_embedding.py` で事前生成も可能
 
 ---
 
@@ -597,26 +622,80 @@ cat /path/to/test.jsonl | \
 2. `--disable_auto_lr_scaling` を使用
 3. 学習率を下げる（`--base_lr 1e-4`）
 
-### GPUメモリ不足 (OOM)
+### gin_channels=768でガビガビ音が発生
+
+**原因**: gin_channelsが大きすぎてspeaker conditioningが過剰に影響
+
+**対処法**: gin_channels=512を使用（デフォルト）
+
+### GPUメモリ不足 (GPU OOM)
 
 **対処法**:
-1. NCCL環境変数を設定: `NCCL_DEBUG=WARN NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1`
-2. `batch_size` と `samples_per_speaker` を下げる
-3. 異なるバッチサイズからのリジュームを避ける
+1. `batch_size` と `samples_per_speaker` を下げる
+2. 異なるバッチサイズからのリジュームを避ける
 
-### 学習速度が遅い
+### システムRAM不足でインスタンス再起動 (CPU OOM)
+
+**原因**: DDP multi-GPUでDataLoaderワーカーが増殖
+- total workers = `num_workers` × `devices` × 2 (train + val)
+- `persistent_workers=True` でワーカーが常駐
+- `pin_memory=True` でロックされたRAMが増大
 
 **対処法**:
-1. V100では `--precision 32-true` を使用（FP16-mixedはbackward passが29-40秒に低下する致命的問題あり）
-2. ゾンビGPUプロセスを確認: `nvidia-smi --query-compute-apps=pid,used_memory --format=csv`
-3. `--max-phoneme-ids 400` で長いシーケンスを除外
-4. `--val-every-n-epochs 10` でValidation頻度を下げる
-5. `--limit-val-batches 20` でValidationバッチ数を削減
-6. WavLM有効時は ~0.03 it/s と遅い。速度優先なら `--no-wavlm` 推奨
+1. `--num-workers 2-4 --no-pin-memory` を使用
+2. val_dataloaderは自動でworkers数を制限 (max 2)
+
+### Zero-shot推論でエラーが出る
+
+**対処法**:
+1. `--speaker-audio` で指定する参照WAVファイルの存在を確認
+2. `--speaker-encoder` で指定する CAM++ ONNXモデルの存在を確認（未指定時はモデル近傍で自動検索）
+3. `--export-mode zero-shot` で変換したONNXモデルを使用しているか確認
+4. 事前生成した `.npy` を使う場合は `numpy.load(path).shape` が `(192,)` であることを確認
+
+### SCLが有効にならない
+
+**原因**: `--speaker-encoder-path` が未指定または指定パスにCAM++ ONNXが存在しない
+
+**対処法**:
+1. `--speaker-encoder-path /data/piper/models/campplus.onnx` を学習コマンドに追加
+2. ファイルの存在を確認: `ls -la /data/piper/models/campplus.onnx`
+3. ログで `CamPPSpeakerEncoder loaded` が出力されていることを確認
+
+### c_spkが大きすぎてSCLが学習を支配する
+
+**原因**: `--c-spk` の値が高すぎる場合がある（非微分SCLなので過大な重みは不安定化を招く）
+
+**対処法**: デフォルト `--c-spk 1.0` から開始し、loss_spk の推移を見ながら調整
+
+### Speaker embeddingの品質が低い（話者再現精度が悪い）
+
+**原因**: Per-utterance抽出でゼロパディングが使用されている（旧バージョン）
+
+**対処法**:
+1. 最新版の `extract_speaker_embedding.py` を使用（個別ONNX推論、パディングなし）
+2. 既存の `speaker_embeddings/` ディレクトリを削除して再抽出
+
+### KLアニーリングが効かない
+
+**原因**: `--kl-annealing-epochs 0` が設定されている、またはepoch数が既にアニーリング期間を超過
+
+**対処法**:
+1. `--kl-annealing-epochs 10`（デフォルト）を確認。0に設定するとアニーリング無効
+2. ログで `kl_weight` の値を確認。アニーリング中は 0.1 から 1.0 へ線形増加
+3. 途中再開の場合、`current_epoch` がアニーリング期間内か確認
+
+### loss_durがloss_gen_allを支配する
+
+**原因**: StochasticDurationPredictor (SDP) のNLL損失が無制限に負に発散し、loss_gen_all全体を引き下げる
+
+**対処法**:
+1. `loss_dur` に `clamp(min=-100)` を適用して下限を設ける
+2. 個別損失ログ（loss_dur, loss_kl, loss_mel等）を監視し、loss_durの異常な負値を早期検出
 
 ### ONNX変換エラー
 
-- `CUDA_VISIBLE_DEVICES=""` でCPUモードを使用
+- `CUDA_VISIBLE_DEVICES=""`でCPUモードを使用
 
 ---
 
@@ -624,9 +703,9 @@ cat /path/to/test.jsonl | \
 
 | リソース | URL |
 |----------|-----|
-| つくよみちゃん 6langモデル | `ayousanz/piper-plus-tsukuyomi-chan` |
-| 6langベースモデル | `ayousanz/piper-plus-base` |
+| つくよみちゃんモデル | `ayousanz/piper-plus-tsukuyomi-chan` |
 | 20話者データセット | `ayousanz/moe-speech-20speakers-ljspeech` |
+| ベースモデル | `ayousanz/piper-plus-base` |
 
 ---
 
@@ -634,71 +713,14 @@ cat /path/to/test.jsonl | \
 
 | PR/Issue | 内容 | 状態 |
 |----------|------|------|
-| PR #239 | FP16変換ツール | Merged |
-| PR #218 | 6言語マルチリンガル + C++ G2P | Merged |
+| PR #244 | C++/Python CLI UX改善 (--text, --list-models, --download-model) | Open |
+| `feat/zero-shot-tts` | Zero-Shot TTS (Dual-Mode Speaker Conditioning) | 開発中 |
+| PR #230 | Docker テスト強化・ブランチ統一 | Merged |
+| PR #229 | C++/Python音素化パイプライン同期 (M1-M4) | Merged |
 | PR #212 | WavLM Discriminator追加 | Open |
 | PR #210 | Issue #204, #207 実装 | Open |
+| Issue #204 | 疑問詞マーカーの拡張 | 実装完了 |
+| Issue #207 | 文脈依存N phoneme variants | 実装完了 |
+| Issue #198 | WavLM Discriminator | 実装完了 |
 | PR #196 | A1/A2/A3 prosody機能 | Merged |
 | PR #195 | FP16 Mixed Precision | Merged |
-
----
-
-## アーカイブ: バイリンガル版の履歴 (v2/v3/v4)
-
-> 以下は6言語版に置き換えられた旧バージョンの参考情報です。
-
-### バージョン比較
-
-| 指標 | v2 | v3 | v4 | **6lang (現在)** |
-|------|-----|-----|-----|-----------------|
-| 言語数 | 2 | 2 | 2 | **6** |
-| 総発話数 | 63,325 | 115,795 | 135,060 | **508,187** |
-| 話者数 | 40 | 848 | 330 | **571** |
-| シンボル数 | 97 | 97 | 97 | **173** |
-| 学習期間 | 4h19分 (200ep) | ~3日 (350ep) | ~46時間 (150ep) | **~92時間 (75ep)** |
-| gradient steps | ~110K | ~202K | ~270K | **~282K** |
-
-### v4 バイリンガル (学習完了 2026-03-04)
-
-JA 60,148発話 (20話者) + EN 74,912発話 (LibriTTS-R 310話者) = 135,060発話、330話者。150 epoch / ~46時間。EN per-speaker データ密度 17.8分 (v3比2.8倍)。v4 の JA+EN が 6lang のベースデータとして再利用されている。
-
-**チェックポイント:** `output-bilingual-ja-en-v4/lightning_logs/version_0/checkpoints/epoch=149-step=269700.ckpt`
-
-### v3 バイリンガル (学習完了 2026-02-27)
-
-JA 60,148発話 (20話者) + EN 55,647発話 (LibriTTS-R 828話者) = 115,795発話、848話者、174h。350 epoch / ~3日。`--language-balanced-sampling` で JA:EN = 50:50 を強制。
-
-**チェックポイント:** `output-bilingual-ja-en-v3/lightning_logs/version_0/checkpoints/epoch=349-step=202300.ckpt`
-
-### つくよみちゃん ファインチューニング履歴
-
-v3 -> v4 -> v4-freeze-dp -> v4-emb-lang-fix -> 6lang-v2 と段階的に改善。
-
-1. **v3ベース (2026-02-28)**: 初回転移学習。`--resume_from_checkpoint` で strict=False フォールバック。emb_lang[1] EN 初期化問題を後処理で修正。
-2. **v4ベース (2026-03-04)**: チェックポイント事前変換方式 (emb_g除去 + emb_lang補正)。DP catastrophic forgetting が発生 (音声長 1.11s)。
-3. **v4 freeze-dp (2026-03-04)**: `--freeze-dp` で DP 凍結。音声長 1.11s -> 1.76s に改善 (59%)。
-4. **v4 emb-lang-fix (2026-03-05)**: `--resume-from-multispeaker-checkpoint` + 後処理 emb_lang コピーの2段階方式を確立。
-5. **6lang-v2 (2026-03-16)**: 6言語ベースから転移。freeze_dpタイミングバグ修正後に再実行して成功。
-
-**Key learnings:**
-- `emb_lang[0]` -> `emb_lang[1:N]` コピーによる声質統一 (ONNX エクスポート前の後処理)
-- `--freeze-dp` による DP catastrophic forgetting 防止
-- `--resume-from-multispeaker-checkpoint` による自動変換 (emb_g除去 + emb_lang補正 + freeze-dp)
-
-### 旧データセット・モデルパス
-
-| 種類 | パス |
-|------|------|
-| v4 データセット | `/data/piper/dataset-bilingual-ja-en-v4/` |
-| v3 データセット | `/data/piper/dataset-bilingual-ja-en-v3/` |
-| v2 データセット | `/data/piper/dataset-bilingual-ja-en-v2/` |
-| つくよみちゃん v3 finetune データ | `/data/piper/dataset-tsukuyomi-finetune-v3/` |
-| v4 ONNX | `/data/piper/output-bilingual-ja-en-v4/bilingual-ja-en-v4-150epoch.onnx` |
-| v3 ONNX | `/data/piper/output-bilingual-ja-en-v3/bilingual-ja-en-v3-350epoch.onnx` |
-| v2 ONNX | `/data/piper/output-bilingual-ja-en-v2/bilingual-ja-en-v2-200epoch.onnx` |
-| つくよみちゃん v4 emb-lang-fix | `/data/piper/output-tsukuyomi-finetune-v4-emb-lang-fix/tsukuyomi-v4-emb-lang-fix.onnx` |
-| つくよみちゃん v4 freeze-dp | `/data/piper/output-tsukuyomi-finetune-v4-freeze-dp/tsukuyomi-v4-freeze-dp.onnx` |
-| つくよみちゃん v3 | `/data/piper/output-tsukuyomi-finetune-v3/tsukuyomi-v3-emb_lang_fixed.onnx` |
-| 20話者 JA-only | `/data/piper/output-moe-speech-20speakers-v2/moe-speech-20speakers-v2.onnx` |
-| LibriTTS-R v4 ソース | `/data/piper/libritts-r/libritts-ljspeech-v4/` |
-| LibriTTS-R v3 ソース | `/data/piper/libritts-r/libritts-ljspeech/` |
