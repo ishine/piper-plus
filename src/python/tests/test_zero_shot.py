@@ -614,15 +614,15 @@ class TestFlowVarianceLearning:
                 )
 
     @pytest.mark.unit
-    def test_flow_dilation_rate_1(self):
-        """SynthesizerTrn flow uses dilation_rate=1 (hardcoded in __init__)"""
+    def test_flow_dilation_rate_2(self):
+        """SynthesizerTrn flow uses dilation_rate=2 for expanded receptive field"""
         model = SynthesizerTrn(
             **MODEL_PARAMS,
             n_speakers=20,
             gin_channels=512,
         )
-        assert model.flow.dilation_rate == 1, (
-            f"Flow dilation_rate should be 1, got {model.flow.dilation_rate}"
+        assert model.flow.dilation_rate == 2, (
+            f"Flow dilation_rate should be 2, got {model.flow.dilation_rate}"
         )
 
     @pytest.mark.unit
