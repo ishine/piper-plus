@@ -89,7 +89,9 @@ class CamPPSpeakerEncoder:
             emb = self.session.run(None, {"fbank": fbank_np})[0]
             embeddings.append(emb[0])
 
-        emb_tensor = torch.tensor(np.stack(embeddings), dtype=torch.float32, device=device)
+        emb_tensor = torch.tensor(
+            np.stack(embeddings), dtype=torch.float32, device=device
+        )
         # L2 normalize
         emb_tensor = torch.nn.functional.normalize(emb_tensor, p=2, dim=-1)
         return emb_tensor
@@ -706,8 +708,7 @@ class VitsModel(pl.LightningModule):
                 and self.current_epoch < self.hparams.kl_annealing_epochs
             ):
                 kl_weight = self.hparams.c_kl * (
-                    0.1
-                    + 0.9 * self.current_epoch / self.hparams.kl_annealing_epochs
+                    0.1 + 0.9 * self.current_epoch / self.hparams.kl_annealing_epochs
                 )
             else:
                 kl_weight = self.hparams.c_kl
