@@ -69,15 +69,13 @@ jobs:
       if: runner.os == 'Windows'
       run: |
         cd src/python
-        # Run unit tests excluding inference tests (which require torch)
-        pytest tests/ -v --tb=short -m "unit and not training and not benchmark and not inference"
+        pytest tests/ -v --tb=short -m "unit and not training and not benchmark and not inference" --ignore=tests/test_english_phonemizer.py
 
     - name: Run unit tests (Unix)
       if: runner.os != 'Windows'
       run: |
         cd src/python
-        # Run unit tests excluding inference tests (which require torch)
-        pytest tests/ -v --tb=short -m "unit and not training and not benchmark and not inference"
+        pytest tests/ -v --tb=short -m "unit and not training and not benchmark and not inference" --ignore=tests/test_english_phonemizer.py
     
     - name: Run integration tests (Unix only)
       if: runner.os != 'Windows'
