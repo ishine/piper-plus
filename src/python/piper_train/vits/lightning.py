@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import pytorch_lightning as pl
 import torch
-import torchaudio
 from torch import autocast
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
@@ -66,6 +65,8 @@ class CamPPSpeakerEncoder:
         Returns:
             [B, 192] L2-normalized speaker embeddings (on same device as input)
         """
+        import torchaudio
+
         device = audio.device
         embeddings = []
         for i in range(audio.size(0)):
