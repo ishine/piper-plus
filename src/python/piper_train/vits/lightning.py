@@ -1,8 +1,11 @@
+import copy
 import logging
 from pathlib import Path
 
+import numpy as np
 import pytorch_lightning as pl
 import torch
+import torchaudio
 from torch import autocast
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
@@ -10,11 +13,13 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from .commons import slice_segments
 from .dataset import Batch, PiperDataset, SpeakerBalancedBatchSampler, UtteranceCollate
 from .losses import (
+    dino_loss,
     discriminator_loss,
     feature_loss,
     generator_loss,
     kl_loss,
     mel_speaker_consistency_loss,
+    speaker_consistency_loss,
 )
 from .mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from .models import MultiPeriodDiscriminator, SynthesizerTrn, WavLMDiscriminator
@@ -32,6 +37,62 @@ _LOGGER = logging.getLogger("vits.lightning")
 
 # Memory cleanup frequency (iterations)
 MEMORY_CLEANUP_FREQUENCY = 500
+
+
+class CamPPSpeakerEncoder:
+    """Lightweight CPU-only ONNX wrapper for CAM++ speaker embedding extraction.
+
+    NOT an nn.Module — excluded from state_dict/checkpoints automatically.
+    Used during training for Speaker Consistency Loss (SCL).
+    """
+
+    def __init__(self, onnx_path: str, source_sr: int = 22050, target_sr: int = 16000):
+        import onnxruntime as ort
+
+        self.session = ort.InferenceSession(
+            onnx_path, providers=["CPUExecutionProvider"]
+        )
+        self.source_sr = source_sr
+        self.target_sr = target_sr
+        _LOGGER.info("CamPPSpeakerEncoder loaded: %s", onnx_path)
+
+    @torch.no_grad()
+    def __call__(self, audio: torch.Tensor) -> torch.Tensor:
+        """Extract speaker embeddings from audio waveforms.
+
+        Args:
+            audio: [B, T] float32 waveform at source_sr
+
+        Returns:
+            [B, 192] L2-normalized speaker embeddings (on same device as input)
+        """
+        device = audio.device
+        embeddings = []
+        for i in range(audio.size(0)):
+            wav = audio[i].unsqueeze(0).cpu()
+            # Resample to 16kHz
+            if self.source_sr != self.target_sr:
+                wav = torchaudio.functional.resample(
+                    wav, self.source_sr, self.target_sr
+                )
+            # Compute 80-dim Fbank
+            fbank = torchaudio.compliance.kaldi.fbank(
+                wav,
+                num_mel_bins=80,
+                sample_frequency=self.target_sr,
+                dither=0.0,
+            )
+            # Mean subtraction (CMVN)
+            fbank = fbank - fbank.mean(dim=0, keepdim=True)
+            # ONNX inference: [1, T, 80] -> [1, 192]
+            fbank_np = fbank.unsqueeze(0).numpy()
+            emb = self.session.run(None, {"fbank": fbank_np})[0]
+            embeddings.append(emb[0])
+
+        emb_tensor = torch.tensor(np.stack(embeddings), dtype=torch.float32, device=device)
+        # L2 normalize
+        emb_tensor = torch.nn.functional.normalize(emb_tensor, p=2, dim=-1)
+        return emb_tensor
 
 
 class VitsModel(pl.LightningModule):
@@ -154,6 +215,32 @@ class VitsModel(pl.LightningModule):
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
         )
+
+        # DINO center buffer for zero-shot speaker embedding regularization
+        use_zero_shot = self.hparams.use_zero_shot and self.hparams.num_speakers > 1
+        if use_zero_shot:
+            self.register_buffer("dino_center", torch.zeros(self.hparams.gin_channels))
+
+        # DINO EMA teacher for spk_proj (must be after model_g creation)
+        self.spk_proj_teacher = None
+        if use_zero_shot and hasattr(self.model_g, "spk_proj"):
+            self.spk_proj_teacher = copy.deepcopy(self.model_g.spk_proj)
+            self.spk_proj_teacher.requires_grad_(False)
+
+        # CAM++ Speaker Encoder for SCL (optional, CPU-only ONNX, not an nn.Module)
+        self.speaker_encoder = None
+        if use_zero_shot and self.hparams.speaker_encoder_path is not None:
+            encoder_path = Path(self.hparams.speaker_encoder_path)
+            if encoder_path.exists():
+                self.speaker_encoder = CamPPSpeakerEncoder(
+                    str(encoder_path),
+                    source_sr=self.hparams.sample_rate,
+                )
+                _LOGGER.info("CamPPSpeakerEncoder loaded: %s", encoder_path)
+            else:
+                _LOGGER.warning(
+                    "speaker_encoder_path not found, SCL disabled: %s", encoder_path
+                )
 
         # WavLM Discriminator (optional)
         self.model_d_wavlm = None
@@ -613,19 +700,47 @@ class VitsModel(pl.LightningModule):
         _y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.model_d(y, y_hat)
 
         with autocast(self.device.type, enabled=False):
+            # KL annealing: linearly increase from 0.1*c_kl to c_kl
+            if (
+                self.hparams.kl_annealing_epochs > 0
+                and self.current_epoch < self.hparams.kl_annealing_epochs
+            ):
+                kl_weight = self.hparams.c_kl * (
+                    0.1
+                    + 0.9 * self.current_epoch / self.hparams.kl_annealing_epochs
+                )
+            else:
+                kl_weight = self.hparams.c_kl
+
             # Generator loss
             loss_dur = torch.sum(l_length.float())
+            # Clamp SDP NLL to prevent loss_dur from dominating loss_gen_all
+            loss_dur = torch.clamp(loss_dur, min=-100.0)
             loss_mel = F.l1_loss(y_mel, y_hat_mel) * self.hparams.c_mel
-            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * self.hparams.c_kl
+            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * kl_weight
 
             loss_fm = feature_loss(fmap_r, fmap_g)
             loss_gen, _losses_gen = generator_loss(y_d_hat_g)
 
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
 
-            # Mel Speaker Consistency Loss (differentiable, multi-speaker only)
-            # Used as fallback when CAM++ speaker encoder is not available
+            # --- Speaker Consistency Loss (SCL) ---
+            # CAM++ ONNX encoder path (primary, when speaker_encoder is loaded)
             if (
+                self.hparams.c_spk > 0
+                and speaker_embeddings is not None
+                and self.speaker_encoder is not None
+            ):
+                with torch.no_grad():
+                    gen_embedding = self.speaker_encoder(y_hat.squeeze(1))
+                loss_spk = (
+                    speaker_consistency_loss(gen_embedding, speaker_embeddings)
+                    * self.hparams.c_spk
+                )
+                loss_gen_all = loss_gen_all + loss_spk
+                self._log_with_batch_info("loss_spk", loss_spk, batch)
+            # Mel-domain SCL fallback (differentiable, no external encoder needed)
+            elif (
                 self.hparams.num_speakers > 1
                 and self.hparams.c_spk > 0
                 and self.speaker_encoder is None
@@ -643,6 +758,36 @@ class VitsModel(pl.LightningModule):
                 )
                 loss_gen_all = loss_gen_all + loss_spk * self.hparams.c_spk
                 self._log_with_batch_info("loss_spk", loss_spk, batch)
+
+            # --- DINO Self-Distillation Loss ---
+            if (
+                self.hparams.c_dino > 0
+                and speaker_embeddings is not None
+                and self.spk_proj_teacher is not None
+            ):
+                student_emb = self.model_g.spk_proj(speaker_embeddings)
+                with torch.no_grad():
+                    teacher_emb = self.spk_proj_teacher(speaker_embeddings)
+                loss_dino = (
+                    dino_loss(student_emb, teacher_emb, self.dino_center)
+                    * self.hparams.c_dino
+                )
+                loss_gen_all = loss_gen_all + loss_dino
+                self._log_with_batch_info("loss_dino", loss_dino, batch)
+
+                # EMA update for teacher
+                if self.training:
+                    with torch.no_grad():
+                        for p_ema, p in zip(
+                            self.spk_proj_teacher.parameters(),
+                            self.model_g.spk_proj.parameters(),
+                            strict=True,
+                        ):
+                            p_ema.mul_(0.996).add_(p.data, alpha=0.004)
+
+                        batch_center = teacher_emb.mean(dim=0)
+                        self.dino_center.mul_(0.996).add_(batch_center, alpha=0.004)
+                        self.dino_center.clamp_(min=-10, max=10)
 
             # WavLM Discriminator loss (optional)
             if self.model_d_wavlm is not None:
@@ -664,6 +809,12 @@ class VitsModel(pl.LightningModule):
                 self._log_with_batch_info("loss_fm_wavlm", loss_fm_wavlm, batch)
 
             self._log_with_batch_info("loss_gen_all", loss_gen_all, batch)
+            self._log_with_batch_info("loss_mel", loss_mel, batch)
+            self._log_with_batch_info("loss_kl", loss_kl, batch)
+            self._log_with_batch_info("loss_dur", loss_dur, batch)
+            self._log_with_batch_info("loss_fm", loss_fm, batch)
+            self._log_with_batch_info("loss_gen", loss_gen, batch)
+            self._log_with_batch_info("kl_weight", kl_weight, batch)
 
             return loss_gen_all
 

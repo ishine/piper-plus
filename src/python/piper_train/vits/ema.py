@@ -110,6 +110,7 @@ class EMACallback(Callback):
         self.save_ema_weights_in_callback_state = save_ema_weights_in_callback_state
 
         self.ema_generator = None
+        self.ema_spk_proj = None
         self.ema_discriminator = None
 
     def on_fit_start(self, trainer, model):
@@ -120,11 +121,12 @@ class EMACallback(Callback):
             decay=self.decay,
         )
 
-        # Optionally also apply to discriminator
-        # self.ema_discriminator = ExponentialMovingAverage(
-        #     model.model_d,
-        #     decay=self.decay
-        # )
+        # Also track spk_proj for zero-shot stability
+        if hasattr(model.model_g, "spk_proj"):
+            self.ema_spk_proj = ExponentialMovingAverage(
+                model.model_g.spk_proj,
+                decay=self.decay,
+            )
 
     def on_train_batch_end(self, trainer, model, outputs, batch, batch_idx):
         """Update EMA after each training step."""
@@ -133,6 +135,8 @@ class EMACallback(Callback):
         if step >= self.start_step and step % self.apply_ema_every_n_steps == 0:
             if self.ema_generator is not None:
                 self.ema_generator.update()
+            if self.ema_spk_proj is not None:
+                self.ema_spk_proj.update()
             if self.ema_discriminator is not None:
                 self.ema_discriminator.update()
 
@@ -140,6 +144,8 @@ class EMACallback(Callback):
         """Apply EMA weights for validation."""
         if self.ema_generator is not None:
             self.ema_generator.apply_shadow()
+        if self.ema_spk_proj is not None:
+            self.ema_spk_proj.apply_shadow()
         if self.ema_discriminator is not None:
             self.ema_discriminator.apply_shadow()
 
@@ -147,6 +153,8 @@ class EMACallback(Callback):
         """Restore original weights after validation."""
         if self.ema_generator is not None:
             self.ema_generator.restore()
+        if self.ema_spk_proj is not None:
+            self.ema_spk_proj.restore()
         if self.ema_discriminator is not None:
             self.ema_discriminator.restore()
 
@@ -155,6 +163,9 @@ class EMACallback(Callback):
         if self.save_ema_weights_in_callback_state:
             checkpoint["ema_generator_state"] = (
                 self.ema_generator.state_dict() if self.ema_generator else None
+            )
+            checkpoint["ema_spk_proj_state"] = (
+                self.ema_spk_proj.state_dict() if self.ema_spk_proj else None
             )
             checkpoint["ema_discriminator_state"] = (
                 self.ema_discriminator.state_dict() if self.ema_discriminator else None
@@ -168,6 +179,14 @@ class EMACallback(Callback):
                     model.model_g.dec, decay=self.decay
                 )
             self.ema_generator.load_state_dict(checkpoint["ema_generator_state"])
+
+        if "ema_spk_proj_state" in checkpoint and checkpoint["ema_spk_proj_state"]:
+            if self.ema_spk_proj is None and hasattr(model.model_g, "spk_proj"):
+                self.ema_spk_proj = ExponentialMovingAverage(
+                    model.model_g.spk_proj, decay=self.decay
+                )
+            if self.ema_spk_proj is not None:
+                self.ema_spk_proj.load_state_dict(checkpoint["ema_spk_proj_state"])
 
         if (
             "ema_discriminator_state" in checkpoint

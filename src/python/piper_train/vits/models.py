@@ -847,7 +847,7 @@ class SynthesizerTrn(nn.Module):
             gin_channels=gin_channels,
         )
         self.flow = ResidualCouplingBlock(
-            inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels
+            inter_channels, hidden_channels, 5, 2, 4, gin_channels=gin_channels
         )
 
         # Prosody feature projection (A1/A2/A3 → prosody_dim)
