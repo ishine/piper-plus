@@ -87,7 +87,7 @@ class CamPPSpeakerEncoder:
             fbank = fbank - fbank.mean(dim=0, keepdim=True)
             # ONNX inference: [1, T, 80] -> [1, 192]
             fbank_np = fbank.unsqueeze(0).numpy()
-            emb = self.session.run(None, {"fbank": fbank_np})[0]
+            emb = self.session.run(None, {"input": fbank_np})[0]
             embeddings.append(emb[0])
 
         emb_tensor = torch.tensor(
