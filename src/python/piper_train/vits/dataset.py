@@ -125,58 +125,42 @@ class PiperDataset(Dataset):
 
     def __getitem__(self, idx) -> UtteranceTensors:
         utt = self.utterances[idx]
-        # 問題のあるファイルでロードが失敗した場合はスキップして次を試す
-        while True:
-            try:
-                audio_norm = _load_tensor(utt.audio_norm_path)
-                if audio_norm.dim() == 1:
-                    audio_norm = audio_norm.unsqueeze(0)
+        audio_norm = _load_tensor(utt.audio_norm_path)
+        if audio_norm.dim() == 1:
+            audio_norm = audio_norm.unsqueeze(0)
 
-                spectrogram = _load_tensor(utt.audio_spec_path)
-                # Convert float16 spec to float32 (new caches are saved as float16 to save disk space)
-                if spectrogram.dtype == torch.float16:
-                    spectrogram = spectrogram.float()
+        spectrogram = _load_tensor(utt.audio_spec_path)
+        # Convert float16 spec to float32 (new caches are saved as float16 to save disk space)
+        if spectrogram.dtype == torch.float16:
+            spectrogram = spectrogram.float()
 
-                # Convert prosody_features to tensor if available
-                prosody_tensor = None
-                if utt.prosody_features is not None:
-                    prosody_tensor = self._prosody_features_to_tensor(
-                        utt.prosody_features
-                    )
+        # Convert prosody_features to tensor if available
+        prosody_tensor = None
+        if utt.prosody_features is not None:
+            prosody_tensor = self._prosody_features_to_tensor(utt.prosody_features)
 
-                # Load speaker embedding from .npy file if available
-                speaker_embedding_tensor = None
-                if utt.speaker_embedding_path is not None:
-                    spk_emb = np.load(
-                        utt.speaker_embedding_path, allow_pickle=False
-                    ).astype(np.float32)
-                    speaker_embedding_tensor = torch.from_numpy(spk_emb)
+        # Load speaker embedding from .npy file if available
+        speaker_embedding_tensor = None
+        if utt.speaker_embedding_path is not None:
+            spk_emb = np.load(utt.speaker_embedding_path, allow_pickle=False).astype(
+                np.float32
+            )
+            speaker_embedding_tensor = torch.from_numpy(spk_emb)
 
-                return UtteranceTensors(
-                    phoneme_ids=LongTensor(utt.phoneme_ids),
-                    audio_norm=audio_norm,
-                    spectrogram=spectrogram,
-                    speaker_id=(
-                        LongTensor([utt.speaker_id])
-                        if utt.speaker_id is not None
-                        else None
-                    ),
-                    language_id=(
-                        LongTensor([utt.language_id])
-                        if utt.language_id is not None
-                        else None
-                    ),
-                    text=utt.text,
-                    prosody_features=prosody_tensor,
-                    speaker_embedding=speaker_embedding_tensor,
-                )
-            except Exception as e:
-                _LOGGER.error(
-                    "Failed to load tensors for %s (spec: %s): %s",
-                    utt.audio_norm_path,
-                    utt.audio_spec_path,
-                    e,
-                )
+        return UtteranceTensors(
+            phoneme_ids=LongTensor(utt.phoneme_ids),
+            audio_norm=audio_norm,
+            spectrogram=spectrogram,
+            speaker_id=(
+                LongTensor([utt.speaker_id]) if utt.speaker_id is not None else None
+            ),
+            language_id=(
+                LongTensor([utt.language_id]) if utt.language_id is not None else None
+            ),
+            text=utt.text,
+            prosody_features=prosody_tensor,
+            speaker_embedding=speaker_embedding_tensor,
+        )
 
     @staticmethod
     def _validate_cache_files(utt: Utterance) -> bool:
